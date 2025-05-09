@@ -54,7 +54,43 @@ ULONGLONG Memory::getModuleBaseAddr(ULONG procId, const char* modName) {
     CloseHandle(hSnap);
     return modBaseAddr;
 }
+HMODULE Memory::getLoadedModule(HMODULE parentModule, const char* modName) {
+    MODULEINFO moduleInfo;
+    if (!GetModuleInformation(GetCurrentProcess(), parentModule, &moduleInfo, sizeof(moduleInfo))) {
+        return NULL;
+    }
 
+
+    HANDLE hModuleSnap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    if (hModuleSnap == INVALID_HANDLE_VALUE) {
+        return NULL;
+    }
+
+    MODULEENTRY32 me32;
+    me32.dwSize = sizeof(MODULEENTRY32);
+
+    if (!Module32First(hModuleSnap, &me32)) {
+        CloseHandle(hModuleSnap);
+        return NULL;
+    }
+
+    HMODULE foundModule = NULL;
+    do {
+
+        if ((ULONGLONG)me32.modBaseAddr >= (ULONGLONG)moduleInfo.lpBaseOfDll &&
+            (ULONGLONG)me32.modBaseAddr < (ULONGLONG)moduleInfo.lpBaseOfDll + moduleInfo.SizeOfImage) {
+
+
+            if (_stricmp(me32.szModule, modName) == 0) {
+                foundModule = (HMODULE)me32.modBaseAddr;
+                break;
+            }
+        }
+    } while (Module32Next(hModuleSnap, &me32));
+
+    CloseHandle(hModuleSnap);
+    return foundModule;
+}
 std::unordered_map<std::string, HMODULE> Memory::getModules(HANDLE handle) {
 
     std::unordered_map<std::string, HMODULE> map = std::unordered_map<std::string, HMODULE>();
@@ -75,7 +111,7 @@ std::unordered_map<std::string, HMODULE> Memory::getModules(HANDLE handle) {
 }
 
 std::vector<BYTE> Memory::readFuncBytes(HANDLE handle, HMODULE module, ULONG functionRVA, std::string funcName) {
-    ULONGLONG estimatedFunctionSize = estimateFuncSize(handle, module, funcName, functionRVA);
+    ULONGLONG estimatedFunctionSize = optionalCheckFuncSize(handle, module, funcName, functionRVA);
     return readFuncBytes(handle, module, functionRVA, estimatedFunctionSize);
 }
 
@@ -89,8 +125,10 @@ std::vector<BYTE> Memory::readFuncBytes(HANDLE handle, HMODULE module, ULONG fun
 
     ULONG_PTR bytesRead;
     if (!ReadProcessMemory(handle, functionAddress, functionBytes.data(), bytesToRead, &bytesRead)) {
-        spdlog::error("Failed to read function bytes. Error: {}", GetLastError());
-        return {};
+        if (GetLastError() != 299) { //status partial copy
+            spdlog::error("Failed to read function bytes. Error: {}", GetLastError());
+            return {};
+        }
     }
 
     if (bytesRead != bytesToRead) {
@@ -101,20 +139,20 @@ std::vector<BYTE> Memory::readFuncBytes(HANDLE handle, HMODULE module, ULONG fun
     return functionBytes;
 }
 
-ULONGLONG Memory::estimateFuncSize(HANDLE handle, HMODULE module, std::string funcName, ULONG functionRVA) {
+ULONGLONG Memory::optionalCheckFuncSize(HANDLE handle, HMODULE module, std::string funcName, ULONG functionRVA) {
     //we can possibly get the true function size from the storage in the .pdata section, containing exception info
 
     //read modules dos header
     IMAGE_DOS_HEADER dosHeader;
     if (!ReadProcessMemory(handle, module, (LPVOID)&dosHeader, sizeof(dosHeader), 0)) {
         spdlog::error("Failed to read DOS header: {}", GetLastError());
-        goto estimation;
+        return 1024;
     }
     //read the ntHeader using the offset provided in the dosHeader
     IMAGE_NT_HEADERS ntHeaders;
     if (!ReadProcessMemory(handle, (BYTE*)module + dosHeader.e_lfanew, &ntHeaders, sizeof(ntHeaders), 0)) {
         spdlog::error("Failed to read NT headers: {}", GetLastError());
-        goto estimation;
+        return 1024;
     }
 
 
@@ -125,7 +163,7 @@ ULONGLONG Memory::estimateFuncSize(HANDLE handle, HMODULE module, std::string fu
 
         if (!ReadProcessMemory(handle, (LPVOID)((BYTE*)module + ntHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].VirtualAddress), funcTable, sizeof(funcTable), 0)) {
             delete funcTable;
-            goto estimation;
+            return 1024;
         }
 
         //its not common to actually find this entry, most likely we will have to estimate
@@ -134,35 +172,12 @@ ULONGLONG Memory::estimateFuncSize(HANDLE handle, HMODULE module, std::string fu
                 ULONG funcEnd = funcTable[i].EndAddress;
                 ULONGLONG size = static_cast<ULONGLONG>(funcEnd) - functionRVA;
                 delete funcTable;
-                return size;
+                return std::min((ULONGLONG)1024,size);
             }
         }
         delete funcTable;
     }
-
-    //we couldnt get the true size, so we estimate below
-
-    estimation:
-    //estimation
-    const ULONGLONG maxSize = 1024;
-    return maxSize; // i dont like the estimation i changed my mind
-    std::vector<BYTE> buffer(maxSize);
-
-    if (!ReadProcessMemory(handle, (BYTE*)module + functionRVA, buffer.data(), maxSize, nullptr)) {
-        return 0;
-    }
-
-    // Look for return instructions (0xC3, 0xC2) or other function endings
-    for (size_t i = 0; i < maxSize; i++) {
-        if (buffer[i] == 0x90) {
-            return i;
-        }
-        if (buffer[i] == 0xC3) {
-            return i + 1;
-        }
-    }
-
-    return maxSize;
+    return 1024;
 }
 
 std::unordered_map<std::string, ULONG> Memory::getExportsFunctions(HANDLE handle, HMODULE module) {
@@ -290,4 +305,123 @@ std::unordered_map<std::string, ULONG> Memory::getExportsFunctions(HANDLE handle
 
     return exportMap;
 }
+
+std::unordered_map<std::string, IATModuleEntry> Memory::getIAT(HANDLE handle, HMODULE module) {
+
+    std::unordered_map<std::string, IATModuleEntry> iat = std::unordered_map<std::string, IATModuleEntry>();
+    //read modules dos header
+    IMAGE_DOS_HEADER dosHeader;
+    if (!ReadProcessMemory(handle, module, (LPVOID)&dosHeader, sizeof(dosHeader), 0)) {
+        spdlog::error("Failed to read DOS header: {}", GetLastError());
+        return iat;
+    }
+
+    //read the ntHeader using the offset provided in the dosHeader
+    IMAGE_NT_HEADERS ntHeaders;
+    if (!ReadProcessMemory(handle, (BYTE*)module + dosHeader.e_lfanew, &ntHeaders, sizeof(ntHeaders), 0)) {
+        spdlog::error("Failed to read NT headers: {}", GetLastError());
+        return iat;
+    }
+
+    if (ntHeaders.Signature != IMAGE_NT_SIGNATURE) {
+        spdlog::error("Invalid NT header signature!");
+        return iat;
+    }
+
+    // get the import directory
+    IMAGE_DATA_DIRECTORY importDirectory = ntHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (importDirectory.Size == 0) {
+        std::cerr << "No import directory found" << std::endl;
+        return iat;
+    }
+
+    // read the import descriptor array
+    IMAGE_IMPORT_DESCRIPTOR* importDescriptors = (IMAGE_IMPORT_DESCRIPTOR*)malloc(importDirectory.Size);
+    LPVOID importDescAddr = (LPVOID)((DWORD_PTR)module + importDirectory.VirtualAddress);
+    if (!ReadProcessMemory(handle, importDescAddr, importDescriptors, importDirectory.Size, nullptr)) {
+        std::cerr << "Failed to read import descriptors: " << GetLastError() << std::endl;
+        free(importDescriptors);
+        return iat;
+    }
+     
+
+
+
+    // iterate through each import descriptor (DLL)
+    for (int i = 0; importDescriptors[i].Characteristics != 0; i++) {
+
+        char dllName[MAX_PATH] = { 0 };
+        LPVOID dllNameAddr = (LPVOID)((ULONGLONG)handle + importDescriptors[i].Name);
+        if (!ReadProcessMemory(handle, dllNameAddr, &dllName, MAX_PATH, nullptr)) {
+            if (GetLastError() != 299) { //ignore partial read errors, they happen
+                std::cerr << "Failed to read ID DLL name: " << GetLastError() << std::endl;
+                continue;
+            }
+        }
+        HMODULE childModule = getLoadedModule(module, dllName);
+        if (!childModule) {
+            std::cout << "failed to get child module" << std::endl;
+            continue;
+        }
+        // get the original thunk (INT) and the IAT
+        IMAGE_THUNK_DATA* originalThunk = nullptr;
+        IMAGE_THUNK_DATA* iatThunk = nullptr;
+
+        if (importDescriptors[i].OriginalFirstThunk) {
+            originalThunk = (IMAGE_THUNK_DATA*)malloc(sizeof(IMAGE_THUNK_DATA));
+            LPVOID originalThunkAddr = (LPVOID)((ULONGLONG)handle + importDescriptors[i].OriginalFirstThunk);
+            if (!ReadProcessMemory(handle, originalThunkAddr, originalThunk, sizeof(IMAGE_THUNK_DATA), nullptr)) {
+                std::cerr << "Failed to read original thunk for ID DLL " << GetLastError() << std::endl;
+                free(originalThunk);
+                continue;
+            }
+        }
+
+        iatThunk = (IMAGE_THUNK_DATA*)malloc(sizeof(IMAGE_THUNK_DATA));
+        LPVOID iatThunkAddr = (LPVOID)((DWORD_PTR)module + importDescriptors[i].FirstThunk);
+        if (!ReadProcessMemory(handle, iatThunkAddr, iatThunk, sizeof(IMAGE_THUNK_DATA), nullptr)) {
+            std::cerr << "ReadProcessMemory failed for IAT thunk: " << GetLastError() << std::endl;
+            free(originalThunk);
+            free(iatThunk);
+            continue;
+        }
+
+        IATModuleEntry entry = {};
+        entry.name = dllName;
+        entry.module = childModule;
+        // iterate through each function in the IAT
+        std::unordered_map<std::string, ULONGLONG> functionAddresses = std::unordered_map<std::string, ULONGLONG>();
+
+        for (int j = 0; originalThunk ? (originalThunk[j].u1.AddressOfData != 0) : (iatThunk[j].u1.Function != 0); j++) {
+
+            ULONGLONG addr = (ULONGLONG)iatThunk[j].u1.Function;
+
+            // check if function is imported by ordinal or by name
+            char* funcName = 0;
+            if (originalThunk && (originalThunk[j].u1.Ordinal & IMAGE_ORDINAL_FLAG) == 0) {
+                // import by name - read the IMAGE_IMPORT_BY_NAME structure
+                IMAGE_IMPORT_BY_NAME importByName;
+                LPVOID importByNameAddr = (LPVOID)((DWORD_PTR)module + originalThunk[j].u1.AddressOfData);
+                if (ReadProcessMemory(handle, importByNameAddr, &importByName, sizeof(IMAGE_IMPORT_BY_NAME), nullptr)) {
+                    funcName = (char*)importByName.Name;
+                }
+            }
+            else {
+                //im not gonna handle ordinal function imports
+            }
+            if (funcName) {
+                functionAddresses[std::string(funcName)] = addr;
+            }
+        }
+        entry.functions = functionAddresses;
+
+        free(originalThunk);
+        free(iatThunk);
+    }
+
+    free(importDescriptors);
+
+    return iat;
+}
+
 

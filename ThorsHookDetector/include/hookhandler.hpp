@@ -3,12 +3,12 @@
 class Decompiler;
 namespace InlineHookHandler {
 	
-	void scanForHooks(HANDLE procHandle, Decompiler* decompiler);
+	void scanForHooks(HANDLE procHandle, Decompiler* decompiler, bool loadlibs, bool ignorediff);
 
 }
 
 namespace IATHookHandler {
 
-	void scanForHooks(HANDLE procHandle, Decompiler* decompiler);
+	void scanForHooks(std::string procName, HANDLE procHandle, Decompiler* decompiler);
 
 }

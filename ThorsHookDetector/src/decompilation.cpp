@@ -20,72 +20,108 @@ Decompiler::~Decompiler() {
 	cs_close(&handle);
 }
 
-void Decompiler::printDecompilation(const std::vector<BYTE>& code, ULONGLONG address) {
+void Decompiler::printDecompilation(Decompilation decomp) {
     if (handle == NULL) return;
 
-    cs_insn* insn;
-    size_t count = cs_disasm(handle, code.data(), code.size(), address, 0, &insn);
+    cs_insn* insn = decomp.insn;
+    size_t count = decomp.count;
 
-    if (count > 0) {
+    std::cout << std::left
+        << std::setw(10) << "ADDRESS"
+        << std::setw(20) << "BYTES"
+        << std::setw(20) << "MNEMONIC"
+        << "OPERANDS" << std::endl;
 
-        std::cout << std::left
-            << std::setw(10) << "ADDRESS"
-            << std::setw(20) << "BYTES"
-            << std::setw(20) << "MNEMONIC"
-            << "OPERANDS" << std::endl;
-
-        std::cout << std::string(80, '-') << std::endl;
+    std::cout << std::string(80, '-') << std::endl;
 
 
-        for (size_t i = 0; i < count; i++) {
+    for (size_t i = 0; i < count; i++) {
 
-            std::string bytes_str;
-            for (size_t j = 0; j < insn[i].size; j++) {
-                char byte[4];
-                snprintf(byte, sizeof(byte), "%02x ", insn[i].bytes[j]);
-                bytes_str += byte;
-            }
-
-            std::cout << std::hex << std::setw(10) << insn[i].address
-                << std::setw(20) << bytes_str
-                << std::setw(20) << insn[i].mnemonic
-                << insn[i].op_str << std::endl;
+        std::string bytes_str;
+        for (size_t j = 0; j < insn[i].size; j++) {
+            char byte[4];
+            snprintf(byte, sizeof(byte), "%02x ", insn[i].bytes[j]);
+            bytes_str += byte;
         }
 
+        std::cout << std::hex << std::setw(10) << insn[i].address
+            << std::setw(20) << bytes_str
+            << std::setw(20) << insn[i].mnemonic
+            << insn[i].op_str << std::endl;
+    }
+}
+ULONGLONG Decompiler::estimateFuncSize(const std::vector<BYTE>& c, ULONGLONG baseAddr) {
+    std::vector<BYTE> code;
+    std::copy(c.begin(), c.end(), std::back_inserter(code));
+    cs_insn* insn;
+    size_t bytes_to_keep = 0;
+    // Use code.data() to get the raw pointer and code.size() for the size
+    size_t count = cs_disasm(handle, code.data(), code.size(), baseAddr, 0, &insn);
 
+    if (count > 0) {
+        for (size_t i = 0; i < count; i++) {
+            bytes_to_keep += insn[i].size;
+
+            // Check for return instruction
+            bool is_return = false;
+            if (insn[i].detail) {
+                for (uint8_t g = 0; g < insn[i].detail->groups_count; g++) {
+                    if (insn[i].detail->groups[g] == CS_GRP_RET) {
+                        is_return = true;
+                        break;
+                    }
+                }
+            }
+
+            // Architecture-specific checks
+            switch (arch) {
+            case CS_ARCH_X86:
+                if (insn[i].id == X86_INS_RET ||
+                    insn[i].id == X86_INS_RETF) {
+                    is_return = true;
+                }
+                break;
+            case CS_ARCH_ARM64:
+                if (insn[i].id == ARM64_INS_RET) {
+                    is_return = true;
+                }
+                break;
+                // Add other architectures as needed
+            default:
+                break;
+            }
+
+            if (is_return) {
+                break;
+            }
+        }
         cs_free(insn, count);
     }
-    else {
+
+    return bytes_to_keep+1;
+}
+
+Decompilation Decompiler::decompile(std::vector<BYTE>& code, ULONGLONG baseAddr) {
+    ULONGLONG sizeEstimate = estimateFuncSize(code, baseAddr);
+    code.resize(sizeEstimate);
+    cs_insn* insn;
+    size_t count = cs_disasm(handle, code.data(), code.size(), baseAddr, 0, &insn);
+    if (count == 0) {
         spdlog::error("Failed to disassemble bytes");
+        return {0};
     }
+    return Decompilation(insn, count, baseAddr);
 }
 
-static bool compare(cs_insn* insn1, cs_insn* insn2, int i, int j) {
-    std::string string1;
-    for (size_t m = 0; m < insn1[i].size; m++) {
-        char byte[4];
-        snprintf(byte, sizeof(byte), "%02x ", insn1[i].bytes[m]);
-        string1 += byte;
-    }
+std::pair<bool,size_t> Decompiler::linesToPrint(Decompilation decomp1, Decompilation decomp2, bool print, size_t lines = 16) {
+    size_t count1 = decomp1.count;
+    size_t count2 = decomp2.count;
+    cs_insn* insn1 = decomp1.insn;
+    cs_insn* insn2 = decomp2.insn;
+    ULONGLONG baseAddr1 = decomp1.baseAddr;
+    ULONGLONG baseAddr2 = decomp2.baseAddr;
 
-    std::string string2;
-    for (size_t m = 0; m < insn2[j].size; m++) {
-        char byte[4];
-        snprintf(byte, sizeof(byte), "%02x ", insn1[j].bytes[m]);
-        string2 += byte;
-    }
-
-    return strcmp(string1.c_str(), string2.c_str()) != 0;
-
-}
-int Decompiler::linesToPrint(cs_insn* insn1, cs_insn* insn2, size_t count1, size_t count2, ULONGLONG codeBaseAddr, ULONGLONG originalBaseAddr, bool print, size_t lines = 16) {
-
-    if (count1 == 0 || count2 == 0) {
-        spdlog::error("Failed to disassemble one or both byte blocks");
-        if (count1 > 0) cs_free(insn1, count1);
-        if (count2 > 0) cs_free(insn2, count2);
-        return 0;
-    }
+    
 
     if (print) {
         std::cout << std::left
@@ -100,7 +136,7 @@ int Decompiler::linesToPrint(cs_insn* insn1, cs_insn* insn2, size_t count1, size
     size_t i = 0, j = 0;
     size_t lastModification = 0;
     while ((i < count1 || j < count2) && std::max(i,j) < lines) {
-        if (i < count1 && j < count2 && insn1[i].address - codeBaseAddr == insn2[j].address - originalBaseAddr && std::max(i, j)) {
+        if (i < count1 && j < count2 && insn1[i].address - baseAddr1 == insn2[j].address - baseAddr2) {
             // Addresses match, compare the instructions
             if (insn1[i].size == insn2[j].size &&
                 memcmp(insn1[i].bytes, insn2[j].bytes, insn1[i].size) == 0) {
@@ -160,7 +196,7 @@ int Decompiler::linesToPrint(cs_insn* insn1, cs_insn* insn2, size_t count1, size
         else {
             // Addresses don't match - one code has extra instructions
             if (j >= count2 || (i < count1 && (j >= count2 ||
-                (insn1[i].address - codeBaseAddr) < (insn2[j].address - originalBaseAddr)))) {
+                (insn1[i].address - baseAddr1) < (insn2[j].address - baseAddr2)))) {
                 // Extra instruction in code (green)
                 if (print) {
                     std::string bytes_str;
@@ -200,19 +236,18 @@ int Decompiler::linesToPrint(cs_insn* insn1, cs_insn* insn2, size_t count1, size
         }
     }
     if (print) {
-        return 0;
+        return { false,0 };
     }
     else {
-        return std::min(lastModification+12,std::max(count1,count2));
+        return { lastModification != 0,std::min(lastModification + 12,std::max(count1,count2)) };
     }
 }
-void Decompiler::printDecompilationDiff(const std::vector<BYTE>& code, const std::vector<BYTE>& originalCode, ULONGLONG codeBaseAddr, ULONGLONG originalBaseAddr) {
-    cs_insn* insn1, * insn2;
-    size_t count1 = cs_disasm(handle, code.data(), code.size(), codeBaseAddr, 0, &insn1);
-    size_t count2 = cs_disasm(handle, originalCode.data(), originalCode.size(), originalBaseAddr, 0, &insn2);
-    size_t linesToRead = linesToPrint(insn1, insn2,count1,count2, codeBaseAddr, originalBaseAddr,false);
-    linesToPrint(insn1, insn2,count1,count2, codeBaseAddr, originalBaseAddr, true,linesToRead);
+bool Decompiler::printDecompilationDiff(std::string moduleName, std::string funcName, Decompilation decomp1, Decompilation decomp2) {
 
-    cs_free(insn1, count1);
-    cs_free(insn2, count2);
+    std::pair<bool,size_t> linesToRead = linesToPrint(decomp1,decomp2,false);
+    if (!linesToRead.first) return false; //is not modified
+    if(!funcName.empty()) spdlog::info("[{}] Found modified function!: {}",moduleName, funcName);
+    linesToPrint(decomp1, decomp2, true,linesToRead.second);
+    if ((decomp1.count - linesToRead.second) != 0) std::cout << "------ (" << (decomp1.count - linesToRead.second) << ") lines remaining. . . ------" << std::endl;
+    return true;
 }
