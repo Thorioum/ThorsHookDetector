@@ -112,6 +112,45 @@ HMODULE Memory::getLoadedModule(HANDLE handle, const char* modName) {
     CloseHandle(hSnap);
     return NULL;
 }
+HMODULE Memory::findModuleByAddress(HANDLE handle, ULONGLONG address) {
+    HMODULE modules[1024];
+    ULONG modulesSize;
+
+    if (!EnumProcessModulesEx(handle, modules, sizeof(modules), &modulesSize, LIST_MODULES_ALL))
+    {
+        return NULL;
+    }
+
+    ULONG moduleCount = modulesSize / sizeof(HMODULE);
+
+    for (DWORD i = 0; i < moduleCount; i++)
+    {
+        MODULEINFO modInfo;
+        if (!GetModuleInformation(handle, modules[i], &modInfo, sizeof(modInfo)))
+        {
+            continue; 
+        }
+
+        ULONGLONG baseAddr = reinterpret_cast<ULONGLONG>(modInfo.lpBaseOfDll);
+        ULONGLONG endAddr = baseAddr + modInfo.SizeOfImage;
+
+        if (address >= baseAddr && address < endAddr)
+        {
+            return modules[i]; 
+        }
+    }
+
+    return NULL; 
+}
+ULONG Memory::getModuleSize(HANDLE handle, HMODULE module) {
+    MODULEINFO moduleInfo;
+    if (GetModuleInformation(handle, module, &moduleInfo, sizeof(moduleInfo)))
+    {
+        return moduleInfo.SizeOfImage;
+    }
+    return 0; 
+}
+
 std::unordered_map<std::string, HMODULE> Memory::getModules(HANDLE handle) {
 
     std::unordered_map<std::string, HMODULE> map = std::unordered_map<std::string, HMODULE>();

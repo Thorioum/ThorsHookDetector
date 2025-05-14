@@ -1,4 +1,5 @@
-#include "../include/decompilation.hpp"
+﻿#include "../include/decompilation.hpp"
+#include "../include/memory.hpp"
 #include <spdlog/spdlog.h>
 #include <iostream>
 
@@ -127,6 +128,8 @@ std::pair<bool,size_t> Decompiler::linesToPrint(Decompilation decomp1, Decompila
     
 
     if (print) {
+        std::cout << std::string(80, '-') << std::endl;
+
         std::cout << std::left
             << std::setw(10) << "ADDRESS"
             << std::setw(32) << "BYTES"
@@ -247,6 +250,7 @@ std::pair<bool,size_t> Decompiler::linesToPrint(Decompilation decomp1, Decompila
         }
     }
     if (print) {
+        std::cout << std::string(80, '-') << std::endl;
         return { false,0 };
     }
     else {
@@ -259,6 +263,6 @@ bool Decompiler::printDecompilationDiff(std::string moduleName, std::string func
     if (!linesToRead.first) return false; //is not modified
     if(!funcName.empty()) spdlog::info("[{}] Found modified function!: {}",moduleName, funcName);
     linesToPrint(decomp1, decomp2, true,linesToRead.second);
-    if ((decomp1.count - linesToRead.second) != 0) std::cout << "------ (" << (decomp1.count - linesToRead.second) << ") lines remaining. . . ------" << std::endl;
+    if ((decomp1.count - linesToRead.second) != 0) std::cout << "------ (" << std::dec << (decomp1.count - linesToRead.second) << ") lines remaining. . . ------" << std::endl;
     return true;
 }

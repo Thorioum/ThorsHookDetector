@@ -23,6 +23,16 @@ namespace InlineHookHandler {
 	Result scanForHooks(HANDLE procHandle, Decompiler* decompiler, bool loadlibs, bool ignorediff);
 
 }
+namespace EATHookHandler {
+	struct EATHookedFunction {
+		ULONGLONG originalAddress;
+		ULONGLONG hookedAddress;
+	};
+	struct Result {
+		std::unordered_map<std::string, std::unordered_map<std::string, EATHookedFunction>> hookedFuncs;
+	};
+	Result scanForHooks(HANDLE procHandle, Decompiler* decompiler, std::vector<std::string> ignoredModules);
+}
 
 namespace IATHookHandler {
 	struct IATHookedFunction {

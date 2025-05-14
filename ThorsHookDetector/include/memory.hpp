@@ -22,7 +22,8 @@ namespace Memory {
 
 	ULONGLONG getModuleBaseAddr(ULONG procId, const char* modName);
 	HMODULE getLoadedModule(HANDLE handle, const char* modName);
-
+	ULONG getModuleSize(HANDLE handle, HMODULE module);
+	HMODULE findModuleByAddress(HANDLE handle, ULONGLONG address);
 	//key - modName, value - module
 	std::unordered_map<std::string,HMODULE> getModules(HANDLE handle);
 

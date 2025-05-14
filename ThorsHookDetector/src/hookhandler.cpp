@@ -6,6 +6,7 @@
 #include <iostream>
 #include <winternl.h>
 #include <TlHelp32.h>
+#include <Psapi.h>
 
 InlineHookHandler::Result InlineHookHandler::scanForHooks(HANDLE procHandle, Decompiler* decompiler, bool loadlibs, bool ignorediff) {
 	InlineHookHandler::Result result;
@@ -70,8 +71,10 @@ InlineHookHandler::Result InlineHookHandler::scanForHooks(HANDLE procHandle, Dec
 				continue;
 			}
 			if (procFuncRVA != localFuncRVA && !ignorediff) {
-				spdlog::info("Skipping module \"{}\", as RVAs dont match. (Different DLL version?)", procModuleElement.first);
-				result.ignoredModules.push_back(procModuleElement.first);
+				if (!(procFuncRVA > (ULONGLONG)procModule && procFuncRVA < (ULONGLONG)((BYTE*)procModule + Memory::getModuleSize(procHandle, procModule)))) {
+					spdlog::info("Skipping module \"{}\", as RVAs dont match. (Different DLL version?)", procModuleElement.first);
+					result.ignoredModules.push_back(procModuleElement.first);
+				}
 				break;
 			}
 			if (decompiler->printDecompilationDiff(procModuleElement.first, procFuncElement.first, decomp1, decomp2)) {
@@ -94,6 +97,50 @@ InlineHookHandler::Result InlineHookHandler::scanForHooks(HANDLE procHandle, Dec
 		Sleep(5);
 	}
 	return result;
+}
+EATHookHandler::Result EATHookHandler::scanForHooks(HANDLE procHandle, Decompiler* decompiler, std::vector<std::string> ignoredModules)
+{
+	Result result;
+	result.hookedFuncs = std::unordered_map<std::string, std::unordered_map<std::string, EATHookedFunction>>();
+
+	HANDLE localHandle = GetCurrentProcess();
+
+	std::unordered_map<std::string, HMODULE> procModules = Memory::getModules(procHandle);
+	std::unordered_map<std::string, HMODULE> localModules = Memory::getModules(localHandle);
+
+	for (auto& procModuleElement : procModules) {
+		HMODULE procModule = procModuleElement.second;
+		std::unordered_map<std::string, ULONG> procModuleFunctions = Memory::getExportsFunctions(procHandle, procModule);
+		HMODULE localModule = localModules.at(procModuleElement.first);
+		std::unordered_map<std::string, ULONG> localModuleFunctions = Memory::getExportsFunctions(localHandle, localModule);
+
+		for (auto& procFuncElement : procModuleFunctions) {
+			if (!localModuleFunctions.count(procFuncElement.first)) {
+				continue;
+			}
+
+			if (std::find(ignoredModules.begin(), ignoredModules.end(), procModuleElement.first) != ignoredModules.end()) continue;
+
+			ULONG procFuncRVA = procFuncElement.second;
+			ULONG localFuncRVA = localModuleFunctions.at(procFuncElement.first);
+
+			//address is not contained within module
+			if (!(procFuncRVA > (ULONGLONG)procModule && procFuncRVA < (ULONGLONG)procModule + Memory::getModuleSize(procHandle, procModule))) {
+				std::string moduleKey = procModuleElement.first;
+				std::string funcKey = procFuncElement.first;
+				if (!result.hookedFuncs.count(moduleKey)) {
+					result.hookedFuncs[moduleKey] = std::unordered_map<std::string, EATHookedFunction>();
+				}
+				EATHookedFunction hookFunc = {
+					localFuncRVA,
+					procFuncRVA,
+				};
+				result.hookedFuncs[moduleKey][funcKey] = hookFunc;
+				spdlog::info("Found hook in {}'s EAT Table!: [{}] {} -> {}", moduleKey, funcKey, Util::toHexString((ULONGLONG)localFuncRVA), Util::toHexString((ULONGLONG)procFuncRVA));
+
+			}
+		}
+	}
 }
 
 IATHookHandler::Result IATHookHandler::scanForHooks(std::string procName, HANDLE procHandle, std::vector<std::string> ignoredModules, Decompiler* decompiler) {
@@ -129,7 +176,7 @@ IATHookHandler::Result IATHookHandler::scanForHooks(std::string procName, HANDLE
 					/*correct address*/((ULONGLONG)procModule + localModuleFuncRVA),/*correct base (the one given to us by external proc) + the correct rva (which we got from the local module)*/ 
 					/*hooked address*/((ULONGLONG)(LONGLONG)procModuleFuncAddr)
 				};
-				spdlog::info("Found hook in {}'s IAT Table from module {}!: [{}] 0x{} -> 0x{}", entryElement.first, entryElement2.first, entryElement3.first, Util::toHexString((ULONGLONG)localModuleFuncAddr), Util::toHexString((ULONGLONG)procModuleFuncAddr));
+				spdlog::info("Found hook in {}'s IAT Table from module {}!: [{}] {} -> {}", entryElement.first, entryElement2.first, entryElement3.first, Util::toHexString((ULONGLONG)localModuleFuncAddr), Util::toHexString((ULONGLONG)procModuleFuncAddr));
 			}
 		}
 	}
@@ -145,6 +192,13 @@ void GeneralHookHandler::scanForHooks(std::string procName, HANDLE procHandle, D
 	spdlog::info("Beginning IAT analysis. . .");
 
 	IATHookHandler::Result iatResult = IATHookHandler::scanForHooks(procName, procHandle, inlineResult.ignoredModules, decompiler);
+	if (iatResult.hookedFuncs.empty()) {
+		spdlog::info("No hooks found in the IAT tables of all scanned modules.");
+	}
+
+	spdlog::info("Beginning IAT analysis. . .");
+
+	EATHookHandler::Result iatResult = EATHookHandler::scanForHooks(procHandle, decompiler,inlineResult.ignoredModules);
 	if (iatResult.hookedFuncs.empty()) {
 		spdlog::info("No hooks found in the IAT tables of all scanned modules.");
 	}
@@ -323,6 +377,12 @@ void GeneralHookHandler::scanForHooks(std::string procName, HANDLE procHandle, D
 						ULONGLONG address = std::stoull(args.at(0), nullptr, 16);
 						auto funcBytes = Memory::readFuncBytes(procHandle, address, 1024);
 						Decompilation decomp = decompiler->decompile(funcBytes, address);
+
+						char moduleName[MAX_PATH] = { 0 };
+						HMODULE module = Memory::findModuleByAddress(procHandle, address);
+						if(module) GetModuleFileNameExA(procHandle, module, moduleName, sizeof(moduleName));
+
+						if (moduleName[0] != 0) std::cout << "-- (" << moduleName << ") --" << std::endl;
 						decompiler->printDecompilation(decomp);
 						cs_free(decomp.insn, decomp.count);
 					}
@@ -347,7 +407,7 @@ void GeneralHookHandler::scanForHooks(std::string procName, HANDLE procHandle, D
 					catch (const std::exception& ex) {
 						std::unordered_map<std::string, ULONG> procModuleFunctions = Memory::getExportsFunctions(procHandle, procModule);
 						if (!procModuleFunctions.count(func)) {
-							spdlog::error("Function {} not found in function.", func);
+							spdlog::error("Function {} not found in module.", func);
 							goto continueBlock;
 						}
 						funcRVA = procModuleFunctions.at(func);
