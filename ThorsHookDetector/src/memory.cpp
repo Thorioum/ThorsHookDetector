@@ -4,6 +4,8 @@
 #include <Psapi.h>
 #include <spdlog/spdlog.h>
 #include <iostream>
+#include <tchar.h>
+#include "../include/util.hpp"
 
 struct HandleDisposer {
     using pointer = HANDLE;
@@ -15,6 +17,39 @@ struct HandleDisposer {
 };
 using unique_handle = std::unique_ptr<HANDLE, HandleDisposer>;
 
+std::pair<HANDLE, ULONG> Memory::WaitForProcess(ULONG dwDesiredAccess, BOOL bInheritHandle, std::string procName)
+{
+    ULONG procId = NULL;
+	while (!procId) {
+		procId = getProcId(procName);
+		if (procId) break;
+        Sleep(10);
+	}
+	HANDLE handle = OpenProcess(dwDesiredAccess, bInheritHandle, procId);
+	if (handle == INVALID_HANDLE_VALUE || !handle) {
+		spdlog::error("Error getting handle for process: {}", procName);
+		return { NULL, NULL };
+	}
+    else {
+        spdlog::info("Opened handle to {} with PID: {}", procName, procId);
+        return { handle, procId };
+    }
+}
+bool Memory::handleIsStillValid(HANDLE handle) {
+    ULONG procId = NULL;
+    procId = GetProcessId(handle);
+    HANDLE process = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, procId);
+    if (process == NULL) {
+        return false;
+    }
+    ULONG exitCode;
+    if (GetExitCodeProcess(process, &exitCode)) {
+        CloseHandle(process);
+        return (exitCode == STILL_ACTIVE);
+    }
+    CloseHandle(process);
+    return true;
+}
 ULONG Memory::getProcId(std::string name) {
     PROCESSENTRY32 procEntry;
     procEntry.dwSize = sizeof(MODULEENTRY32);
@@ -24,12 +59,15 @@ ULONG Memory::getProcId(std::string name) {
     if (snapshot_handle.get() == INVALID_HANDLE_VALUE)
         return NULL;
 
-    while (Process32Next(snapshot_handle.get(), &procEntry) == TRUE) {
-        if (name.compare(procEntry.szExeFile) == NULL) {
-            return procEntry.th32ProcessID;
+    int highestCount = 0;
+    ULONG procId = NULL;
+    do {
+        if (!name.compare(procEntry.szExeFile) && procEntry.cntThreads > highestCount) {
+            highestCount = procEntry.cntThreads;
+            procId = procEntry.th32ProcessID;
         }
-    }
-    return NULL;
+    } while (Process32Next(snapshot_handle.get(), &procEntry));
+    return procId;
 }
 
 ULONGLONG Memory::getModuleBaseAddr(ULONG procId, const char* modName) {
@@ -54,42 +92,25 @@ ULONGLONG Memory::getModuleBaseAddr(ULONG procId, const char* modName) {
     CloseHandle(hSnap);
     return modBaseAddr;
 }
-HMODULE Memory::getLoadedModule(HMODULE parentModule, const char* modName) {
-    MODULEINFO moduleInfo;
-    if (!GetModuleInformation(GetCurrentProcess(), parentModule, &moduleInfo, sizeof(moduleInfo))) {
-        return NULL;
-    }
-
-
-    HANDLE hModuleSnap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
-    if (hModuleSnap == INVALID_HANDLE_VALUE) {
-        return NULL;
-    }
-
-    MODULEENTRY32 me32;
-    me32.dwSize = sizeof(MODULEENTRY32);
-
-    if (!Module32First(hModuleSnap, &me32)) {
-        CloseHandle(hModuleSnap);
-        return NULL;
-    }
-
-    HMODULE foundModule = NULL;
-    do {
-
-        if ((ULONGLONG)me32.modBaseAddr >= (ULONGLONG)moduleInfo.lpBaseOfDll &&
-            (ULONGLONG)me32.modBaseAddr < (ULONGLONG)moduleInfo.lpBaseOfDll + moduleInfo.SizeOfImage) {
-
-
-            if (_stricmp(me32.szModule, modName) == 0) {
-                foundModule = (HMODULE)me32.modBaseAddr;
-                break;
-            }
+HMODULE Memory::getLoadedModule(HANDLE handle, const char* modName) {
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetProcessId(handle));
+    if (hSnap != INVALID_HANDLE_VALUE)
+    {
+        MODULEENTRY32 modEntry;
+        modEntry.dwSize = sizeof(modEntry);
+        if (Module32First(hSnap, &modEntry))
+        {
+            do
+            {
+                if (!strcmp(modEntry.szModule, modName))
+                {
+                    return (HMODULE)modEntry.modBaseAddr;
+                }
+            } while (Module32Next(hSnap, &modEntry));
         }
-    } while (Module32Next(hModuleSnap, &me32));
-
-    CloseHandle(hModuleSnap);
-    return foundModule;
+    }
+    CloseHandle(hSnap);
+    return NULL;
 }
 std::unordered_map<std::string, HMODULE> Memory::getModules(HANDLE handle) {
 
@@ -116,15 +137,18 @@ std::vector<BYTE> Memory::readFuncBytes(HANDLE handle, HMODULE module, ULONG fun
 }
 
 std::vector<BYTE> Memory::readFuncBytes(HANDLE handle, HMODULE module, ULONG functionRVA, ULONGLONG bytesToRead) {
-
-    std::vector<BYTE> functionBytes;
-
     LPVOID functionAddress = (BYTE*)module + functionRVA;
+	return readFuncBytes(handle, (ULONGLONG)functionAddress, bytesToRead);
+}
+
+std::vector<BYTE> Memory::readFuncBytes(HANDLE handle, ULONGLONG functionAddress, ULONGLONG bytesToRead)
+{
+    std::vector<BYTE> functionBytes;
 
     functionBytes.resize(bytesToRead);
 
-    ULONG_PTR bytesRead;
-    if (!ReadProcessMemory(handle, functionAddress, functionBytes.data(), bytesToRead, &bytesRead)) {
+    ULONGLONG bytesRead;
+    if (!ReadProcessMemory(handle, (LPVOID)functionAddress, functionBytes.data(), bytesToRead, &bytesRead)) {
         if (GetLastError() != 299) { //status partial copy
             spdlog::error("Failed to read function bytes. Error: {}", GetLastError());
             return {};
@@ -132,7 +156,7 @@ std::vector<BYTE> Memory::readFuncBytes(HANDLE handle, HMODULE module, ULONG fun
     }
 
     if (bytesRead != bytesToRead) {
-        spdlog::error("Failed to read all function bytes. Only read {} of {} bytes",bytesRead,bytesToRead);
+        spdlog::error("Failed to read all function bytes. Only read {} of {} bytes", bytesRead, bytesToRead);
         functionBytes.resize(bytesRead);
     }
 
@@ -182,7 +206,7 @@ ULONGLONG Memory::optionalCheckFuncSize(HANDLE handle, HMODULE module, std::stri
 
 std::unordered_map<std::string, ULONG> Memory::getExportsFunctions(HANDLE handle, HMODULE module) {
 
-    std::unordered_map< std::string, ULONG> exportMap = std::unordered_map< std::string, DWORD>();
+    std::unordered_map< std::string, ULONG> exportMap = std::unordered_map< std::string, ULONG>();
 
     //read modules dos header
     IMAGE_DOS_HEADER dosHeader;
@@ -204,8 +228,8 @@ std::unordered_map<std::string, ULONG> Memory::getExportsFunctions(HANDLE handle
     }
 
     // get export directory RVA and size
-    DWORD exportDirRVA = ntHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
-    DWORD exportDirSize = ntHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+    ULONG exportDirRVA = ntHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+    ULONG exportDirSize = ntHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
 
     if (exportDirRVA == 0) {
         spdlog::error("No export directory found");
@@ -220,24 +244,27 @@ std::unordered_map<std::string, ULONG> Memory::getExportsFunctions(HANDLE handle
         return exportMap;
     }
 
-
+    if (exportDirSize == 0) {
+        spdlog::error("No functions found in export directory");
+        return exportMap;
+    }
     //
     // Read function address table
-    std::vector<DWORD> functions(exportDir.NumberOfFunctions);
+    std::vector<ULONG> functions(exportDir.NumberOfFunctions);
     if (!ReadProcessMemory(handle,
         (BYTE*)module + exportDir.AddressOfFunctions,
         functions.data(),
-        exportDir.NumberOfFunctions * sizeof(DWORD),0)) {
-        spdlog::error("Failed to read function addresses: ", GetLastError());
+        exportDir.NumberOfFunctions * sizeof(ULONG),0)) {
+        spdlog::error("Failed to read functions addresses: ", GetLastError());
         return exportMap;
     }
 
     // Read name pointer table
-    std::vector<DWORD> names(exportDir.NumberOfNames);
+    std::vector<ULONG> names(exportDir.NumberOfNames);
     if (!ReadProcessMemory(handle,
         (BYTE*)module + exportDir.AddressOfNames,
         names.data(),
-        exportDir.NumberOfNames * sizeof(DWORD),0)) {
+        exportDir.NumberOfNames * sizeof(ULONG),0)) {
         spdlog::error("Failed to read name pointers: ", GetLastError());
         return exportMap;
     }
@@ -266,7 +293,7 @@ std::unordered_map<std::string, ULONG> Memory::getExportsFunctions(HANDLE handle
     }
 
     // find executable sections
-    std::vector<DWORD> executableRanges;
+    std::vector<ULONG> executableRanges;
     for (const auto& section : sections) {
         if (section.Characteristics & IMAGE_SCN_MEM_EXECUTE) {
             executableRanges.push_back(section.VirtualAddress);
@@ -274,7 +301,7 @@ std::unordered_map<std::string, ULONG> Memory::getExportsFunctions(HANDLE handle
         }
     }
 
-    for (DWORD i = 0; i < exportDir.NumberOfNames; i++) {
+    for (ULONG i = 0; i < exportDir.NumberOfNames; i++) {
 
         // read function name
         char functionName[256] = { 0 };
@@ -287,7 +314,7 @@ std::unordered_map<std::string, ULONG> Memory::getExportsFunctions(HANDLE handle
         }
 
         // get function RVA
-        DWORD functionRVA = functions[ordinals[i]];
+        ULONG functionRVA = functions[ordinals[i]];
         if (functionRVA == 0) continue;
 
         bool isExecutable = false;
@@ -306,122 +333,360 @@ std::unordered_map<std::string, ULONG> Memory::getExportsFunctions(HANDLE handle
     return exportMap;
 }
 
-std::unordered_map<std::string, IATModuleEntry> Memory::getIAT(HANDLE handle, HMODULE module) {
+std::unordered_map<std::string, IATModule> Memory::getIAT(HANDLE handle) {
+    std::unordered_map<std::string, IATModule> iat = std::unordered_map<std::string, IATModule>();
+    std::unordered_map<std::string, HMODULE> procModules = getModules(handle);
+	for (const auto& moduleElement : procModules) {
+		HMODULE module = moduleElement.second;
 
-    std::unordered_map<std::string, IATModuleEntry> iat = std::unordered_map<std::string, IATModuleEntry>();
+        IATModule iatModule;
+        iatModule.name= moduleElement.first;
+		iatModule.moduleIAT = std::unordered_map<std::string, IATModuleEntry>();
+
+        //read modules dos header
+        IMAGE_DOS_HEADER dosHeader;
+        if (!ReadProcessMemory(handle, module, (LPVOID)&dosHeader, sizeof(dosHeader), 0)) {
+            spdlog::error("Failed to read DOS header: {}", GetLastError());
+            return iat;
+        }
+
+        //read the ntHeader using the offset provided in the dosHeader
+        IMAGE_NT_HEADERS ntHeaders;
+        if (!ReadProcessMemory(handle, (BYTE*)module + dosHeader.e_lfanew, &ntHeaders, sizeof(ntHeaders), 0)) {
+            spdlog::error("Failed to read NT headers: {}", GetLastError());
+            return iat;
+        }
+
+        if (ntHeaders.Signature != IMAGE_NT_SIGNATURE) {
+            spdlog::error("Invalid NT header signature!");
+            return iat;
+        }
+
+        ULONG importDirRVA = ntHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
+        ULONG importDirSize = ntHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size;
+
+        if (importDirSize == 0) {
+			continue;
+        }
+
+        IMAGE_IMPORT_DESCRIPTOR* importDescriptors = new IMAGE_IMPORT_DESCRIPTOR[importDirSize]{ 0 };
+        if (!ReadProcessMemory(handle, (BYTE*)module + importDirRVA, 
+                            importDescriptors, importDirSize,0)) {
+            spdlog::error("Failed to real module import descriptor!");
+            continue;
+        }
+
+
+
+
+        // iterate through each import descriptor (DLL)
+		while (importDescriptors->Name != 0) {
+
+            char dllName[MAX_PATH] = { 0 };
+            if (!ReadProcessMemory(handle, (BYTE*)module + importDescriptors->Name, &dllName, MAX_PATH, nullptr)) {
+                if (GetLastError() != 299) { //ignore partial read errors, they happen
+                    std::cerr << "Failed to read ID DLL name: " << GetLastError() << std::endl;
+                    break;
+                }
+            }
+
+            IATModuleEntry entry;
+            entry.name = dllName;
+
+            ULONG thunkRVA = importDescriptors->OriginalFirstThunk ? importDescriptors->OriginalFirstThunk : importDescriptors->FirstThunk;
+            ULONG iatRVA = importDescriptors->FirstThunk;
+
+            // read thunk data
+            std::vector<IMAGE_THUNK_DATA> thunks;
+            IMAGE_THUNK_DATA thunk;
+            BYTE* thunkAddr = (BYTE*)module + thunkRVA;
+
+            do {
+                if (!ReadProcessMemory(handle, thunkAddr, &thunk,sizeof(IMAGE_THUNK_DATA), 0)) break;
+                if (thunk.u1.AddressOfData == 0) break;
+
+                thunks.push_back(thunk);
+                thunkAddr += sizeof(IMAGE_THUNK_DATA);
+            } while (true);
+
+            // read IAT data
+            std::vector<IMAGE_THUNK_DATA> iats;
+            BYTE* iatAddr = (BYTE*)module + iatRVA;
+
+            do {
+                IMAGE_THUNK_DATA iat;
+                if (!ReadProcessMemory(handle, iatAddr, &iat,sizeof(IMAGE_THUNK_DATA), 0)) break;
+                if (iat.u1.Function == 0) break;
+
+                iats.push_back(iat);
+                iatAddr += sizeof(IMAGE_THUNK_DATA);
+            } while (true);
+
+            // match thunks with IAT entries
+            for (size_t j = 0; j < thunks.size() && j < iats.size(); j++) {
+                ULONGLONG funcAddr = iats[j].u1.Function;
+                std::string name;
+                if (thunks[j].u1.Ordinal & IMAGE_ORDINAL_FLAG) {
+                    //i will not be hnadling ordinal functions
+                    continue;
+                }
+                else {
+                    IMAGE_IMPORT_BY_NAME importByName;
+                    if (ReadProcessMemory(handle, (BYTE*)module + thunks[j].u1.AddressOfData, &importByName,sizeof(IMAGE_IMPORT_BY_NAME),0)) {
+                        char funcName[256] = { 0 };
+                        if (ReadProcessMemory(handle, (BYTE*)module + thunks[j].u1.AddressOfData + sizeof(WORD),
+                            &funcName, sizeof(funcName) - 1,0)) {
+							name = funcName;
+                        }
+                    }
+                }
+				entry.functions[name] = funcAddr;
+                
+            }
+			iatModule.moduleIAT[dllName] = entry;
+			importDescriptors++;
+        }
+        iat[iatModule.name] = iatModule;
+	}
+
+    return iat;
+}
+BOOL ModifyIATEntry(HANDLE hProcess, HMODULE hModule, LPCSTR szFunctionName, LPVOID lpNewAddress) {
+    // Get the DOS header
+    IMAGE_DOS_HEADER dosHeader;
+    if (!ReadProcessMemory(hProcess, hModule, &dosHeader, sizeof(dosHeader), NULL)) {
+        return FALSE;
+    }
+
+    // Verify it's a PE file
+    if (dosHeader.e_magic != IMAGE_DOS_SIGNATURE) {
+        return FALSE;
+    }
+
+    // Get the NT headers
+    IMAGE_NT_HEADERS ntHeaders;
+    if (!ReadProcessMemory(hProcess, (BYTE*)hModule + dosHeader.e_lfanew, &ntHeaders, sizeof(ntHeaders), NULL)) {
+        return FALSE;
+    }
+
+    // Verify PE signature
+    if (ntHeaders.Signature != IMAGE_NT_SIGNATURE) {
+        return FALSE;
+    }
+
+    // Get the import directory
+    IMAGE_DATA_DIRECTORY importDirectory = ntHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+        if (importDirectory.Size == 0) {
+            return FALSE; // No import directory
+        }
+
+    // Read the import descriptor array
+    ULONG dwImportDescSize = importDirectory.Size;
+    ULONG dwNumEntries = dwImportDescSize / sizeof(IMAGE_IMPORT_DESCRIPTOR);
+    IMAGE_IMPORT_DESCRIPTOR* pImportDesc = (IMAGE_IMPORT_DESCRIPTOR*)malloc(dwImportDescSize);
+
+    if (!ReadProcessMemory(hProcess, (BYTE*)hModule + importDirectory.VirtualAddress, pImportDesc, dwImportDescSize, NULL)) {
+        free(pImportDesc);
+        return FALSE;
+    }
+
+    BOOL bFound = FALSE;
+
+    // Iterate through each import descriptor (DLL)
+    for (ULONG i = 0; i < dwNumEntries; i++) {
+        if (pImportDesc[i].OriginalFirstThunk == 0 && pImportDesc[i].FirstThunk == 0) {
+            continue;
+        }
+
+        // Get the IAT and INT (OriginalFirstThunk is the INT, FirstThunk is the IAT)
+        ULONG dwIAT = pImportDesc[i].FirstThunk;
+        ULONG dwINT = pImportDesc[i].OriginalFirstThunk != 0 ? pImportDesc[i].OriginalFirstThunk : dwIAT;
+
+        // Iterate through each function in this DLL's import
+        ULONG dwThunkOffset = 0;
+        while (TRUE) {
+            IMAGE_THUNK_DATA thunkData;
+            if (!ReadProcessMemory(hProcess, (BYTE*)hModule + dwINT + dwThunkOffset, &thunkData, sizeof(thunkData), NULL)) {
+                break;
+            }
+
+            if (thunkData.u1.AddressOfData == 0) {
+                break; // End of list
+            }
+
+            // Check if this is imported by name or ordinal
+            if (!(thunkData.u1.Ordinal & IMAGE_ORDINAL_FLAG)) {
+                // Imported by name - read the IMAGE_IMPORT_BY_NAME structure
+                IMAGE_IMPORT_BY_NAME importByName;
+                if (!ReadProcessMemory(hProcess, (BYTE*)hModule + thunkData.u1.AddressOfData, &importByName, sizeof(importByName), NULL)) {
+                    dwThunkOffset += sizeof(IMAGE_THUNK_DATA);
+                    continue;
+                }
+
+                // Read the function name
+                CHAR szFuncName[256] = { 0 };
+                if (!ReadProcessMemory(hProcess, (BYTE*)hModule + thunkData.u1.AddressOfData + offsetof(IMAGE_IMPORT_BY_NAME, Name),
+                    szFuncName, sizeof(szFuncName), NULL)) {
+                    dwThunkOffset += sizeof(IMAGE_THUNK_DATA);
+                    continue;
+                }
+
+                // Check if this is the function we're looking for
+                if (strcmp(szFuncName, szFunctionName) == 0) {
+                    // Found our function - modify the IAT entry
+                    ULONG dwIATEntry = dwIAT + dwThunkOffset;
+                    LPVOID lpIATAddress = (BYTE*)hModule + dwIATEntry;
+
+                    // Write the new address
+                    if (!WriteProcessMemory(hProcess, lpIATAddress, &lpNewAddress, sizeof(lpNewAddress), NULL)) {
+                        free(pImportDesc);
+                        return FALSE;
+                    }
+
+                    bFound = TRUE;
+                    break;
+                }
+            }
+
+            dwThunkOffset += sizeof(IMAGE_THUNK_DATA);
+        }
+
+        if (bFound) {
+            break;
+        }
+    }
+
+    free(pImportDesc);
+    return bFound;
+}
+void Memory::setIATAddress(HANDLE handle, std::string moduleName, std::string moduleInIATName, std::string funcName, ULONGLONG newAddress)
+{
+    std::unordered_map<std::string, HMODULE> procModules = getModules(handle);
+	if (!procModules.count(moduleName)) {
+		spdlog::error("Module {} not found in process.", moduleName);
+		return;
+	}
+    HMODULE module = procModules.at(moduleName);
+
     //read modules dos header
     IMAGE_DOS_HEADER dosHeader;
     if (!ReadProcessMemory(handle, module, (LPVOID)&dosHeader, sizeof(dosHeader), 0)) {
         spdlog::error("Failed to read DOS header: {}", GetLastError());
-        return iat;
+        return;
     }
 
     //read the ntHeader using the offset provided in the dosHeader
     IMAGE_NT_HEADERS ntHeaders;
     if (!ReadProcessMemory(handle, (BYTE*)module + dosHeader.e_lfanew, &ntHeaders, sizeof(ntHeaders), 0)) {
         spdlog::error("Failed to read NT headers: {}", GetLastError());
-        return iat;
+        return;
     }
 
     if (ntHeaders.Signature != IMAGE_NT_SIGNATURE) {
         spdlog::error("Invalid NT header signature!");
-        return iat;
+        return;
     }
 
-    // get the import directory
-    IMAGE_DATA_DIRECTORY importDirectory = ntHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-    if (importDirectory.Size == 0) {
-        std::cerr << "No import directory found" << std::endl;
-        return iat;
+    ULONG importDirRVA = ntHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
+    ULONG importDirSize = ntHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size;
+
+    if (importDirSize == 0) return;
+    
+
+    IMAGE_IMPORT_DESCRIPTOR* importDescriptors = new IMAGE_IMPORT_DESCRIPTOR[importDirSize]{ 0 };
+    if (!ReadProcessMemory(handle, (BYTE*)module + importDirRVA,
+        importDescriptors, importDirSize, 0)) {
+        spdlog::error("Failed to real module import descriptor!");
+        return;
     }
-
-    // read the import descriptor array
-    IMAGE_IMPORT_DESCRIPTOR* importDescriptors = (IMAGE_IMPORT_DESCRIPTOR*)malloc(importDirectory.Size);
-    LPVOID importDescAddr = (LPVOID)((DWORD_PTR)module + importDirectory.VirtualAddress);
-    if (!ReadProcessMemory(handle, importDescAddr, importDescriptors, importDirectory.Size, nullptr)) {
-        std::cerr << "Failed to read import descriptors: " << GetLastError() << std::endl;
-        free(importDescriptors);
-        return iat;
-    }
-     
-
-
 
     // iterate through each import descriptor (DLL)
-    for (int i = 0; importDescriptors[i].Characteristics != 0; i++) {
+    while (importDescriptors->Name != 0) {
 
         char dllName[MAX_PATH] = { 0 };
-        LPVOID dllNameAddr = (LPVOID)((ULONGLONG)handle + importDescriptors[i].Name);
-        if (!ReadProcessMemory(handle, dllNameAddr, &dllName, MAX_PATH, nullptr)) {
+        if (!ReadProcessMemory(handle, (BYTE*)module + importDescriptors->Name, &dllName, MAX_PATH, nullptr)) {
             if (GetLastError() != 299) { //ignore partial read errors, they happen
                 std::cerr << "Failed to read ID DLL name: " << GetLastError() << std::endl;
-                continue;
+                break;
             }
         }
-        HMODULE childModule = getLoadedModule(module, dllName);
-        if (!childModule) {
-            std::cout << "failed to get child module" << std::endl;
-            continue;
-        }
-        // get the original thunk (INT) and the IAT
-        IMAGE_THUNK_DATA* originalThunk = nullptr;
-        IMAGE_THUNK_DATA* iatThunk = nullptr;
-
-        if (importDescriptors[i].OriginalFirstThunk) {
-            originalThunk = (IMAGE_THUNK_DATA*)malloc(sizeof(IMAGE_THUNK_DATA));
-            LPVOID originalThunkAddr = (LPVOID)((ULONGLONG)handle + importDescriptors[i].OriginalFirstThunk);
-            if (!ReadProcessMemory(handle, originalThunkAddr, originalThunk, sizeof(IMAGE_THUNK_DATA), nullptr)) {
-                std::cerr << "Failed to read original thunk for ID DLL " << GetLastError() << std::endl;
-                free(originalThunk);
-                continue;
-            }
-        }
-
-        iatThunk = (IMAGE_THUNK_DATA*)malloc(sizeof(IMAGE_THUNK_DATA));
-        LPVOID iatThunkAddr = (LPVOID)((DWORD_PTR)module + importDescriptors[i].FirstThunk);
-        if (!ReadProcessMemory(handle, iatThunkAddr, iatThunk, sizeof(IMAGE_THUNK_DATA), nullptr)) {
-            std::cerr << "ReadProcessMemory failed for IAT thunk: " << GetLastError() << std::endl;
-            free(originalThunk);
-            free(iatThunk);
+        if(dllName != moduleInIATName) {
+            importDescriptors++;
             continue;
         }
 
-        IATModuleEntry entry = {};
-        entry.name = dllName;
-        entry.module = childModule;
-        // iterate through each function in the IAT
-        std::unordered_map<std::string, ULONGLONG> functionAddresses = std::unordered_map<std::string, ULONGLONG>();
+        ULONG thunkRVA = importDescriptors->OriginalFirstThunk ? importDescriptors->OriginalFirstThunk : importDescriptors->FirstThunk;
+        ULONG iatRVA = importDescriptors->FirstThunk;
 
-        for (int j = 0; originalThunk ? (originalThunk[j].u1.AddressOfData != 0) : (iatThunk[j].u1.Function != 0); j++) {
+        // read thunk data
+        std::vector<IMAGE_THUNK_DATA> thunks;
+        IMAGE_THUNK_DATA thunk;
+        BYTE* thunkAddr = (BYTE*)module + thunkRVA;
 
-            ULONGLONG addr = (ULONGLONG)iatThunk[j].u1.Function;
+        do {
+            if (!ReadProcessMemory(handle, thunkAddr, &thunk, sizeof(IMAGE_THUNK_DATA), 0)) break;
+            if (thunk.u1.AddressOfData == 0) break;
 
-            // check if function is imported by ordinal or by name
-            char* funcName = 0;
-            if (originalThunk && (originalThunk[j].u1.Ordinal & IMAGE_ORDINAL_FLAG) == 0) {
-                // import by name - read the IMAGE_IMPORT_BY_NAME structure
-                IMAGE_IMPORT_BY_NAME importByName;
-                LPVOID importByNameAddr = (LPVOID)((DWORD_PTR)module + originalThunk[j].u1.AddressOfData);
-                if (ReadProcessMemory(handle, importByNameAddr, &importByName, sizeof(IMAGE_IMPORT_BY_NAME), nullptr)) {
-                    funcName = (char*)importByName.Name;
-                }
+            thunks.push_back(thunk);
+            thunkAddr += sizeof(IMAGE_THUNK_DATA);
+        } while (true);
+
+        // read IAT data
+        std::vector<IMAGE_THUNK_DATA> iats;
+        BYTE* iatAddr = (BYTE*)module + iatRVA;
+
+        do {
+            IMAGE_THUNK_DATA iat;
+            if (!ReadProcessMemory(handle, iatAddr, &iat, sizeof(IMAGE_THUNK_DATA), 0)) break;
+            if (iat.u1.Function == 0) break;
+
+            iats.push_back(iat);
+            iatAddr += sizeof(IMAGE_THUNK_DATA);
+        } while (true);
+
+        // match thunks with IAT entries
+        for (size_t j = 0; j < thunks.size() && j < iats.size(); j++) {
+            ULONGLONG funcAddr = iats[j].u1.Function;
+            std::string name;
+            if (thunks[j].u1.Ordinal & IMAGE_ORDINAL_FLAG) {
+                //i will not be hnadling ordinal functions
+                continue;
             }
             else {
-                //im not gonna handle ordinal function imports
+                IMAGE_IMPORT_BY_NAME importByName;
+                if (ReadProcessMemory(handle, (BYTE*)module + thunks[j].u1.AddressOfData, &importByName, sizeof(IMAGE_IMPORT_BY_NAME), 0)) {
+                    char fn[256] = { 0 };
+                    if (ReadProcessMemory(handle, (BYTE*)module + thunks[j].u1.AddressOfData + sizeof(WORD),
+                        &fn, sizeof(fn) - 1, 0)) {
+                        name = fn;
+                    }
+                    // Check if this is the function we're looking for
+                    if (strcmp(fn, funcName.c_str()) == 0) {
+                        // Found our function - modify the IAT entry
+                        ULONG IATEntry = iatRVA + j*sizeof(IMAGE_THUNK_DATA);
+                        LPVOID IATAddress = (BYTE*)module + IATEntry;
+
+                        ULONG oldProt;
+                        if (!VirtualProtectEx(handle, IATAddress, sizeof(LPVOID), PAGE_READWRITE, &oldProt)) {
+                            spdlog::error("Failed to virtual protect IAT entry. Error: {}", GetLastError());
+                        }
+
+                        if (!WriteProcessMemory(handle, IATAddress, &newAddress, sizeof(newAddress), NULL)) {
+							spdlog::error("Failed to write IAT entry. Error: {}", GetLastError());
+                        }
+                        else {
+							spdlog::info("IAT entry for function {} in {} in {}'s IAT table modified to {}", funcName, moduleInIATName, moduleName, Util::toHexString(newAddress));
+                        }
+
+                        VirtualProtectEx(handle, IATAddress, sizeof(LPVOID), oldProt, &oldProt);
+
+                        break;
+                    }
+                }
             }
-            if (funcName) {
-                functionAddresses[std::string(funcName)] = addr;
-            }
+
         }
-        entry.functions = functionAddresses;
-
-        free(originalThunk);
-        free(iatThunk);
+        importDescriptors++;
     }
-
-    free(importDescriptors);
-
-    return iat;
+    
 }
-
-

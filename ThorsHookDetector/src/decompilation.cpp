@@ -2,10 +2,6 @@
 #include <spdlog/spdlog.h>
 #include <iostream>
 
-#define COLOR_RESET   "\033[0m"
-#define COLOR_GREEN   "\033[32m"
-#define COLOR_RED     "\033[31m"
-
 Decompiler::Decompiler(cs_arch arch, cs_mode mode) {
 	this->mode = mode;
 	this->arch = arch;
@@ -28,7 +24,7 @@ void Decompiler::printDecompilation(Decompilation decomp) {
 
     std::cout << std::left
         << std::setw(10) << "ADDRESS"
-        << std::setw(20) << "BYTES"
+        << std::setw(32) << "BYTES"
         << std::setw(20) << "MNEMONIC"
         << "OPERANDS" << std::endl;
 
@@ -45,7 +41,7 @@ void Decompiler::printDecompilation(Decompilation decomp) {
         }
 
         std::cout << std::hex << std::setw(10) << insn[i].address
-            << std::setw(20) << bytes_str
+            << std::setw(32) << bytes_str
             << std::setw(20) << insn[i].mnemonic
             << insn[i].op_str << std::endl;
     }
@@ -112,7 +108,14 @@ Decompilation Decompiler::decompile(std::vector<BYTE>& code, ULONGLONG baseAddr)
     }
     return Decompilation(insn, count, baseAddr);
 }
-
+void setColor(int color) {
+    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+    SetConsoleTextAttribute(hConsole, color);
+}
+void resetColor() {
+    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+    SetConsoleTextAttribute(hConsole, FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE);
+}
 std::pair<bool,size_t> Decompiler::linesToPrint(Decompilation decomp1, Decompilation decomp2, bool print, size_t lines = 16) {
     size_t count1 = decomp1.count;
     size_t count2 = decomp2.count;
@@ -134,7 +137,7 @@ std::pair<bool,size_t> Decompiler::linesToPrint(Decompilation decomp1, Decompila
     }
 
     size_t i = 0, j = 0;
-    size_t lastModification = 0;
+    size_t lastModification = -1;
     while ((i < count1 || j < count2) && std::max(i,j) < lines) {
         if (i < count1 && j < count2 && insn1[i].address - baseAddr1 == insn2[j].address - baseAddr2) {
             // Addresses match, compare the instructions
@@ -168,11 +171,13 @@ std::pair<bool,size_t> Decompiler::linesToPrint(Decompilation decomp1, Decompila
                         bytes_str1 += byte;
                     }
 
-                    std::cout << COLOR_GREEN << "+"
+                    setColor(FOREGROUND_GREEN | FOREGROUND_INTENSITY);
+                    std::cout << "+"
                         << std::hex << std::setw(10) << insn1[i].address
                         << std::setw(32) << bytes_str1
                         << std::setw(20) << insn1[i].mnemonic
-                        << insn1[i].op_str << COLOR_RESET << std::endl;
+                        << insn1[i].op_str << std::endl;
+                    resetColor();
 
                     // Print original version (red)
                     std::string bytes_str2;
@@ -182,11 +187,13 @@ std::pair<bool,size_t> Decompiler::linesToPrint(Decompilation decomp1, Decompila
                         bytes_str2 += byte;
                     }
 
-                    std::cout << COLOR_RED << "-"
+                    setColor(FOREGROUND_RED | FOREGROUND_INTENSITY);
+                    std::cout << "-"
                         << std::hex << std::setw(10) << insn2[j].address
                         << std::setw(32) << bytes_str2
                         << std::setw(20) << insn2[j].mnemonic
-                        << insn2[j].op_str << COLOR_RESET << std::endl;
+                        << insn2[j].op_str << std::endl;
+                    resetColor();
                 }
                 lastModification = i;
                 i++;
@@ -205,12 +212,14 @@ std::pair<bool,size_t> Decompiler::linesToPrint(Decompilation decomp1, Decompila
                         snprintf(byte, sizeof(byte), "%02x ", insn1[i].bytes[k]);
                         bytes_str += byte;
                     }
-
-                    std::cout << COLOR_GREEN << "+"
+                    setColor(FOREGROUND_GREEN | FOREGROUND_INTENSITY);
+                    std::cout << "+"
                         << std::hex << std::setw(10) << insn1[i].address
                         << std::setw(32) << bytes_str
                         << std::setw(20) << insn1[i].mnemonic
-                        << insn1[i].op_str << COLOR_RESET << std::endl;
+                        << insn1[i].op_str << std::endl;
+                    resetColor();
+
                 }
                 lastModification = i;
                 i++;
@@ -224,13 +233,15 @@ std::pair<bool,size_t> Decompiler::linesToPrint(Decompilation decomp1, Decompila
                         snprintf(byte, sizeof(byte), "%02x ", insn2[j].bytes[k]);
                         bytes_str += byte;
                     }
-
-                    std::cout << COLOR_RED << "-"
+                    setColor(FOREGROUND_RED | FOREGROUND_INTENSITY);
+                    std::cout << "-"
                         << std::hex << std::setw(10) << insn2[j].address
                         << std::setw(32) << bytes_str
                         << std::setw(20) << insn2[j].mnemonic
-                        << insn2[j].op_str << COLOR_RESET << std::endl;
+                        << insn2[j].op_str << std::endl;
+                    resetColor();
                 }
+
                 j++;
             }
         }
@@ -239,7 +250,7 @@ std::pair<bool,size_t> Decompiler::linesToPrint(Decompilation decomp1, Decompila
         return { false,0 };
     }
     else {
-        return { lastModification != 0,std::min(lastModification + 12,std::max(count1,count2)) };
+        return { lastModification != -1,std::min(lastModification + 12,std::max(count1,count2)) };
     }
 }
 bool Decompiler::printDecompilationDiff(std::string moduleName, std::string funcName, Decompilation decomp1, Decompilation decomp2) {
