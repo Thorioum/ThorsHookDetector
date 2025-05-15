@@ -9,31 +9,36 @@ namespace GeneralHookHandler {
 	void writeBytes(HANDLE handle, ULONGLONG address, BYTE*, ULONGLONG size);
 
 }
+
 namespace InlineHookHandler {
-	struct HookedFunction {
-		ULONGLONG funcRVA;
+	
+	struct InlineHookedFunction {
+		ULONGLONG funcRVA; //taken from EAT, relative to the module base address
 		std::vector<BYTE> originalBytes;
 		std::vector<BYTE> hookedBytes;
 	};
 	struct Result {
-		std::vector<std::string> ignoredModules;
 		//key - moduleName, value - map of function names and their original+hooked bytes  -- these are modules loaded into the proccess thats iterated
-		std::unordered_map<std::string, std::unordered_map<std::string, HookedFunction>> hookedFuncs;
+		std::unordered_map<std::string, std::unordered_map<std::string, InlineHookedFunction>> hookedFuncs;
 	};
-	Result scanForHooks(HANDLE procHandle, Decompiler* decompiler, bool loadlibs, bool ignorediff);
+	Result scanForHooks(HANDLE procHandle, Decompiler* decompiler, std::vector<std::string> ignoredModules);
 
 }
+
+//values in the EAT are addresses relative to base address of the specific module their in
 namespace EATHookHandler {
 	struct EATHookedFunction {
-		ULONGLONG originalAddress;
-		ULONGLONG hookedAddress;
+		ULONGLONG originalRVA;
+		ULONGLONG hookedRVA;
 	};
 	struct Result {
+		//key - moduleName, value - the modules EAT table (key - funcName, value - original+hooked function address)
 		std::unordered_map<std::string, std::unordered_map<std::string, EATHookedFunction>> hookedFuncs;
 	};
 	Result scanForHooks(HANDLE procHandle, Decompiler* decompiler, std::vector<std::string> ignoredModules);
 }
 
+//values in the IAT are addresses relative to base address of the process
 namespace IATHookHandler {
 	struct IATHookedFunction {
 		ULONGLONG originalAddress;
@@ -43,6 +48,6 @@ namespace IATHookHandler {
 		//key - moduleName, value - the modules IAT table (key - moduleName, value - map of exported function addresses in that module (key - funcName, value - original+hooked function address)
 		std::unordered_map<std::string, std::unordered_map<std::string, std::unordered_map<std::string, IATHookedFunction>>> hookedFuncs;
 	};
-	Result scanForHooks(std::string procName, HANDLE procHandle, std::vector<std::string> ignoredModules, Decompiler* decompiler);
+	Result scanForHooks(HANDLE procHandle, Decompiler* decompiler, std::vector<std::string> ignoredModules);
 
 }

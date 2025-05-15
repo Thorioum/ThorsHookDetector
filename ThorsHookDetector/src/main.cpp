@@ -14,7 +14,7 @@ int main(int argc, char* argv[])
 		"A program that analyzes the modules and IAT for hooks created by the process.\nWill only check locally loadable modules, if you want to compare with more add dlls to the same directory as this executable");
 	parser.add_epilog("https://thorioum.net");
 
-	parser.add_argument("-p", "--process").required().help("the process to scan").default_value("firefox.exe");
+	parser.add_argument("-p", "--process").required().help("the process to scan");
     parser.add_argument("-l", "--loadlibs").flag().default_value< bool >(true).help("for every module in the target process, this process will try to load its modules with LoadLibrary. this may increase the amount of modules now loaded it can compare with, but if dll's are different versions it will incorrect detect functions as hooks when in reality they are different functions entirely");
     parser.add_argument("-d", "--ignorediff").flag().default_value< bool >(false).help("without this set to true, modules detected with different function offsets than the locally loaded one will be skipped on the premis that the process module is most likely a different version");
 

@@ -8,24 +8,21 @@
 #include <TlHelp32.h>
 #include <Psapi.h>
 
-InlineHookHandler::Result InlineHookHandler::scanForHooks(HANDLE procHandle, Decompiler* decompiler, bool loadlibs, bool ignorediff) {
+InlineHookHandler::Result InlineHookHandler::scanForHooks(HANDLE procHandle, Decompiler* decompiler, std::vector<std::string> ignoredModules) {
 	InlineHookHandler::Result result;
-	result.hookedFuncs = std::unordered_map<std::string, std::unordered_map<std::string, HookedFunction>>();
-	result.ignoredModules = std::vector<std::string>();
+	result.hookedFuncs = std::unordered_map<std::string, std::unordered_map<std::string, InlineHookedFunction>>();
 
 	HANDLE localHandle = GetCurrentProcess();
 
 	std::unordered_map<std::string,HMODULE> procModules = Memory::getModules(procHandle);
-	//attempt to load all process modules into current process before parsing local modules
-	if(loadlibs) for (auto& m : procModules) LoadLibrary(m.first.c_str());	
 	std::unordered_map<std::string,HMODULE> localModules = Memory::getModules(localHandle);
 
-	spdlog::info("Found {} modules in process with {} matching locally.", procModules.size(), Util::countMatchingKeys(procModules, localModules));
 	for (auto& procModuleElement : procModules) {
 
 		//check if this module has been also loaded locally
 		//we can now compare the functions and their bytes in our unaltered version, and the processes modules
 		if (!localModules.count(procModuleElement.first)) continue;
+		if (std::find(ignoredModules.begin(), ignoredModules.end(), procModuleElement.first) != ignoredModules.end()) continue;
 
 		spdlog::info("[] Processing Module \"{}\"", procModuleElement.first);
 
@@ -38,14 +35,12 @@ InlineHookHandler::Result InlineHookHandler::scanForHooks(HANDLE procHandle, Dec
 		for (auto& procFuncElement : procModuleFunctions) {
 			//new function?
 			if (!localModuleFunctions.count(procFuncElement.first)) {
-				if (ignorediff) {
-					spdlog::info("Found new function in \"{}\"!: \"{}\"", procModuleElement.first, procFuncElement.first);
-					ULONG procFuncRVA = procFuncElement.second;
-					auto procFuncBytes = Memory::readFuncBytes(procHandle, procModule, procFuncRVA, procFuncElement.first);
-					Decompilation decomp = decompiler->decompile(procFuncBytes, procFuncRVA);
-					decompiler->printDecompilation(decomp);
-					cs_free(decomp.insn, decomp.count);
-				}
+				spdlog::info("Found new function in \"{}\"!: \"{}\"", procModuleElement.first, procFuncElement.first);
+				ULONG procFuncRVA = procFuncElement.second;
+				auto procFuncBytes = Memory::readFuncBytes(procHandle, procModule, procFuncRVA, procFuncElement.first);
+				Decompilation decomp = decompiler->decompile(procFuncBytes, procFuncRVA);
+				decompiler->printDecompilation(decomp);
+				cs_free(decomp.insn, decomp.count);
 				continue;
 			}
 
@@ -70,20 +65,13 @@ InlineHookHandler::Result InlineHookHandler::scanForHooks(HANDLE procHandle, Dec
 				spdlog::error("Failed to decompile function: {}. Error: {}", procFuncElement.first, GetLastError());
 				continue;
 			}
-			if (procFuncRVA != localFuncRVA && !ignorediff) {
-				if (!(procFuncRVA > (ULONGLONG)procModule && procFuncRVA < (ULONGLONG)((BYTE*)procModule + Memory::getModuleSize(procHandle, procModule)))) {
-					spdlog::info("Skipping module \"{}\", as RVAs dont match. (Different DLL version?)", procModuleElement.first);
-					result.ignoredModules.push_back(procModuleElement.first);
-				}
-				break;
-			}
 			if (decompiler->printDecompilationDiff(procModuleElement.first, procFuncElement.first, decomp1, decomp2)) {
 				std::string moduleKey = procModuleElement.first;
 				std::string funcKey = procFuncElement.first;
 				if (!result.hookedFuncs.count(moduleKey)) {
-					result.hookedFuncs[moduleKey] = std::unordered_map<std::string, HookedFunction>();
+					result.hookedFuncs[moduleKey] = std::unordered_map<std::string, InlineHookedFunction>();
 				}
-				HookedFunction hookFunc = {
+				InlineHookedFunction hookFunc = {
 					procFuncRVA,
 					std::vector<BYTE>(localFuncBytes),
 					std::vector<BYTE>(procFuncBytes)
@@ -111,21 +99,21 @@ EATHookHandler::Result EATHookHandler::scanForHooks(HANDLE procHandle, Decompile
 	for (auto& procModuleElement : procModules) {
 		HMODULE procModule = procModuleElement.second;
 		std::unordered_map<std::string, ULONG> procModuleFunctions = Memory::getExportsFunctions(procHandle, procModule);
+
+		if (!localModules.count(procModuleElement.first)) continue;
+		if (std::find(ignoredModules.begin(), ignoredModules.end(), procModuleElement.first) != ignoredModules.end()) continue;
+
 		HMODULE localModule = localModules.at(procModuleElement.first);
 		std::unordered_map<std::string, ULONG> localModuleFunctions = Memory::getExportsFunctions(localHandle, localModule);
 
 		for (auto& procFuncElement : procModuleFunctions) {
-			if (!localModuleFunctions.count(procFuncElement.first)) {
-				continue;
-			}
-
-			if (std::find(ignoredModules.begin(), ignoredModules.end(), procModuleElement.first) != ignoredModules.end()) continue;
+			if (!localModuleFunctions.count(procFuncElement.first)) continue;
+			
 
 			ULONG procFuncRVA = procFuncElement.second;
 			ULONG localFuncRVA = localModuleFunctions.at(procFuncElement.first);
 
-			//address is not contained within module
-			if (!(procFuncRVA > (ULONGLONG)procModule && procFuncRVA < (ULONGLONG)procModule + Memory::getModuleSize(procHandle, procModule))) {
+			if (procFuncRVA != localFuncRVA) {
 				std::string moduleKey = procModuleElement.first;
 				std::string funcKey = procFuncElement.first;
 				if (!result.hookedFuncs.count(moduleKey)) {
@@ -136,14 +124,16 @@ EATHookHandler::Result EATHookHandler::scanForHooks(HANDLE procHandle, Decompile
 					procFuncRVA,
 				};
 				result.hookedFuncs[moduleKey][funcKey] = hookFunc;
+
 				spdlog::info("Found hook in {}'s EAT Table!: [{}] {} -> {}", moduleKey, funcKey, Util::toHexString((ULONGLONG)localFuncRVA), Util::toHexString((ULONGLONG)procFuncRVA));
 
 			}
 		}
 	}
+	return result;
 }
 
-IATHookHandler::Result IATHookHandler::scanForHooks(std::string procName, HANDLE procHandle, std::vector<std::string> ignoredModules, Decompiler* decompiler) {
+IATHookHandler::Result IATHookHandler::scanForHooks(HANDLE procHandle, Decompiler* decompiler, std::vector<std::string> ignoredModules) {
 	Result result;
 	result.hookedFuncs = std::unordered_map<std::string, std::unordered_map<std::string, std::unordered_map<std::string, IATHookedFunction>>>();
 
@@ -151,7 +141,8 @@ IATHookHandler::Result IATHookHandler::scanForHooks(std::string procName, HANDLE
 	std::unordered_map<std::string, HMODULE> procModules = Memory::getModules(procHandle);
 
 	std::unordered_map<std::string, IATModule> procIAT = Memory::getIAT(procHandle);
-	
+	std::unordered_map<std::string, IATModule> localIAT = Memory::getIAT(GetCurrentProcess());
+
 	for (const auto& entryElement : procIAT) {
 		IATModule entry = entryElement.second;
 
@@ -176,6 +167,10 @@ IATHookHandler::Result IATHookHandler::scanForHooks(std::string procName, HANDLE
 					/*correct address*/((ULONGLONG)procModule + localModuleFuncRVA),/*correct base (the one given to us by external proc) + the correct rva (which we got from the local module)*/ 
 					/*hooked address*/((ULONGLONG)(LONGLONG)procModuleFuncAddr)
 				};
+
+				ULONGLONG b1 = Memory::getModuleBaseAddr(GetProcessId(procHandle), entryElement2.first.c_str());
+				ULONGLONG b2 = Memory::getModuleBaseAddr(GetProcessId(GetCurrentProcess()), entryElement2.first.c_str());
+
 				spdlog::info("Found hook in {}'s IAT Table from module {}!: [{}] {} -> {}", entryElement.first, entryElement2.first, entryElement3.first, Util::toHexString((ULONGLONG)localModuleFuncAddr), Util::toHexString((ULONGLONG)procModuleFuncAddr));
 			}
 		}
@@ -185,46 +180,70 @@ IATHookHandler::Result IATHookHandler::scanForHooks(std::string procName, HANDLE
 }
 
 void GeneralHookHandler::scanForHooks(std::string procName, HANDLE procHandle, Decompiler* decompiler, bool loadlibs, bool ignorediff) {
+
+	
+	//attempt to load all process modules into current process before parsing local modules
+	std::unordered_map<std::string, HMODULE> procModules = Memory::getModules(procHandle);
+	if (loadlibs) for (auto& m : procModules) LoadLibrary(m.first.c_str());
+	std::unordered_map<std::string, HMODULE> localModules = Memory::getModules(GetCurrentProcess());
+
+	//make ignored modules. ignored modules are based on modules that have different sizes than the local version, **usually means they are a different version, and any hooks found might not even be hooks
+	std::vector<std::string> ignoredModules = std::vector<std::string>();
+	if (!ignorediff) {
+		for (auto& procModuleElement : procModules) {
+			HMODULE procModule = procModuleElement.second;
+			if (!localModules.count(procModuleElement.first)) continue;
+			HMODULE localModule = localModules.at(procModuleElement.first);
+			if (Memory::getModuleSize(procHandle,procModule) != Memory::getModuleSize(GetCurrentProcess(),localModule)) {
+				spdlog::info("{} has different size than local dll. Different version? Skipping. . .", procModuleElement.first);
+				ignoredModules.push_back(procModuleElement.first);
+			}
+		}
+	}
+	spdlog::info("Found {} modules in process with {} matching locally.", procModules.size(), Util::countMatchingKeys(procModules, localModules));
+
+	//analysis!
 	spdlog::info("Beginning inline analysis. . .");
 
-	InlineHookHandler::Result inlineResult = InlineHookHandler::scanForHooks(procHandle, decompiler, loadlibs, ignorediff);
+	InlineHookHandler::Result inlineResult = InlineHookHandler::scanForHooks(procHandle, decompiler, ignoredModules);
 
 	spdlog::info("Beginning IAT analysis. . .");
 
-	IATHookHandler::Result iatResult = IATHookHandler::scanForHooks(procName, procHandle, inlineResult.ignoredModules, decompiler);
+	IATHookHandler::Result iatResult = IATHookHandler::scanForHooks(procHandle, decompiler, ignoredModules);
 	if (iatResult.hookedFuncs.empty()) {
 		spdlog::info("No hooks found in the IAT tables of all scanned modules.");
 	}
 
-	spdlog::info("Beginning IAT analysis. . .");
+	spdlog::info("Beginning EAT analysis. . .");
 
-	EATHookHandler::Result iatResult = EATHookHandler::scanForHooks(procHandle, decompiler,inlineResult.ignoredModules);
-	if (iatResult.hookedFuncs.empty()) {
+	EATHookHandler::Result eatResult = EATHookHandler::scanForHooks(procHandle, decompiler, ignoredModules);
+	if (eatResult.hookedFuncs.empty()) {
 		spdlog::info("No hooks found in the IAT tables of all scanned modules.");
 	}
 
+	//command line
 	spdlog::info("All analysis completed!");
 	spdlog::info("---");
 	spdlog::info("---");
 	spdlog::info("Command List:");
 	spdlog::info("---");
 	spdlog::info("---");
-
 	spdlog::info("--- restore-inline <Module Name> <Function Name>");
-	spdlog::info("uses results from the inline hook analysis and restores the functions bytes back to the original");
+	spdlog::info("------ uses results from the inline hook analysis and restores the functions bytes back to the original");
+	spdlog::info("---");
 	spdlog::info("--- restore-inline-all (OPTIONAL)<Module Name>");
-	spdlog::info("uses results from ALL FUNCTIONS in the inline hook analysis (in specific module if specified) and restores the functions bytes back to the original");
-
+	spdlog::info("------ uses results from ALL FUNCTIONS in the inline hook analysis (in specific module if specified) and restores the functions bytes back to the original");
+	spdlog::info("---");
 	spdlog::info("--- restore-iat <Module Name> <Module Name> <Function Name>");
-	spdlog::info("uses results from iat hook analysis to restore addresses in the IAT table back from the hooked function to the original");
+	spdlog::info("------ uses results from iat hook analysis to restore addresses in the IAT table back from the hooked function to the original");
+	spdlog::info("---");
 	spdlog::info("--- restore-iat-all");
-	spdlog::info("uses results from ALL FUNCTIONS in iat hook analysis to restore addresses in the IAT table back from the hooked function to the original");
-
+	spdlog::info("------ uses results from ALL FUNCTIONS in iat hook analysis to restore addresses in the IAT table back from the hooked function to the original");
+	spdlog::info("---");
 	spdlog::info("--- decompile <Relative Virtual Address> || <Module Name> <Function Name>");
-	spdlog::info("decompiles the function at the specified address");
+	spdlog::info("------ decompiles the function at the specified address");
 
-	std::cout << "Type command here: ";
-	std::unordered_map<std::string, HMODULE> procModules = Memory::getModules(procHandle);
+	std::cout << "\nType command here: ";
 
 	std::string input;
 	while (std::getline(std::cin, input)) {
@@ -263,7 +282,7 @@ void GeneralHookHandler::scanForHooks(std::string procName, HANDLE procHandle, D
 				HMODULE module = procModules[moduleName];
 
 				if (inlineResult.hookedFuncs.count(moduleName) && inlineResult.hookedFuncs[moduleName].count(functionName)) {
-					InlineHookHandler::HookedFunction hookedFunc = inlineResult.hookedFuncs[moduleName][functionName];
+					InlineHookHandler::InlineHookedFunction hookedFunc = inlineResult.hookedFuncs[moduleName][functionName];
 
 					spdlog::info("Opening a new handle to write with. . .");
 
@@ -294,7 +313,7 @@ void GeneralHookHandler::scanForHooks(std::string procName, HANDLE procHandle, D
 					spdlog::info("Restoring all functions in module {}. . .", moduleName);
 					for (const auto& funcElement : inlineResult.hookedFuncs[moduleName]) {
 						std::string functionName = funcElement.first;
-						InlineHookHandler::HookedFunction hookedFunc = funcElement.second;
+						InlineHookHandler::InlineHookedFunction hookedFunc = funcElement.second;
 
 						HANDLE writeHandle = OpenProcess(PROCESS_ALL_ACCESS, FALSE, Memory::getProcId(procName));
 
