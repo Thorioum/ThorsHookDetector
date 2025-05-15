@@ -19,3 +19,4 @@ After the analyis completes, gathering hooks, these commands can be ran after to
 
 # Preview of program
 <img width="769" alt="BB2E8044-D671-4A21-B2E5-0241D047C423" src="https://github.com/user-attachments/assets/6cd2963a-9440-4a0d-b8bc-f860c17d925f" />
+<img width="865" alt="0C997315-1434-4D8A-BE67-77C77E7D72EE" src="https://github.com/user-attachments/assets/92fdd051-d2fa-4d01-bc9c-ba5bfac7db12" />
