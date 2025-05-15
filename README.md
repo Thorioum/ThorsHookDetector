@@ -2,7 +2,7 @@
 
 ---
 # Usage
-- Either build yourself with CMAKE, or grab from releases
+- Either build yourself with CMAKE, grab from releases, or grab from build artifacts
 - Run with ``` ThorsHookDetector.exe -p <Process Name> ```
 ## Optional Arguments
 - ``` -l / --loadlibs ```: Will attempt to load all modules in target process into local process with LoadLibrary. Allows for scanning of more modules
