@@ -218,7 +218,7 @@ void GeneralHookHandler::scanForHooks(std::string procName, HANDLE procHandle, D
 
 	EATHookHandler::Result eatResult = EATHookHandler::scanForHooks(procHandle, decompiler, ignoredModules);
 	if (eatResult.hookedFuncs.empty()) {
-		spdlog::info("No hooks found in the IAT tables of all scanned modules.");
+		spdlog::info("No hooks found in the EAT tables of all scanned modules.");
 	}
 
 	//command line
