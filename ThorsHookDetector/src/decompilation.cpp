@@ -3,22 +3,27 @@
 #include <spdlog/spdlog.h>
 #include <iostream>
 
-Decompiler::Decompiler(cs_arch arch, cs_mode mode) {
-	this->mode = mode;
+Decompiler::Decompiler(cs_arch arch) {
 	this->arch = arch;
     cs_err err;
-	if ((err = cs_open(arch, mode, &handle)) != CS_ERR_OK) {
-		spdlog::error("Failed to initialize Capstone: {}", cs_strerror(err));
+	if ((err = cs_open(arch, CS_MODE_32, &handle32)) != CS_ERR_OK) {
+		spdlog::error("Failed to initialize 32x Capstone: {}", cs_strerror(err));
 	}
-	cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
-    cs_option(handle, CS_OPT_SKIPDATA, CS_OPT_ON);
+    if ((err = cs_open(arch, CS_MODE_64, &handle64)) != CS_ERR_OK) {
+        spdlog::error("Failed to initialize 64x Capstone: {}", cs_strerror(err));
+    }
+	cs_option(handle32, CS_OPT_DETAIL, CS_OPT_ON);
+    cs_option(handle32, CS_OPT_SKIPDATA, CS_OPT_ON);
+
+    cs_option(handle64, CS_OPT_DETAIL, CS_OPT_ON);
+    cs_option(handle64, CS_OPT_SKIPDATA, CS_OPT_ON);
 }
 Decompiler::~Decompiler() {
-	cs_close(&handle);
+	cs_close(&handle32);
+    cs_close(&handle64);
 }
 
-void Decompiler::printDecompilation(Decompilation decomp) {
-    if (handle == NULL) return;
+void Decompiler::printDecompilation(Decompilation decomp, ULONGLONG relativeBase) {
 
     cs_insn* insn = decomp.insn;
     size_t count = decomp.count;
@@ -34,26 +39,17 @@ void Decompiler::printDecompilation(Decompilation decomp) {
 
     for (size_t i = 0; i < count; i++) {
 
-        std::string bytes_str;
-        for (size_t j = 0; j < insn[i].size; j++) {
-            char byte[4];
-            snprintf(byte, sizeof(byte), "%02x ", insn[i].bytes[j]);
-            bytes_str += byte;
-        }
+        printLine(insn[i], "", relativeBase);
 
-        std::cout << std::hex << std::setw(10) << insn[i].address
-            << std::setw(32) << bytes_str
-            << std::setw(20) << insn[i].mnemonic
-            << insn[i].op_str << std::endl;
     }
 }
-ULONGLONG Decompiler::estimateFuncSize(const std::vector<BYTE>& c, ULONGLONG baseAddr) {
+ULONGLONG Decompiler::estimateFuncSize(const std::vector<BYTE>& c, ULONGLONG baseAddr, bool is64Bit) {
     std::vector<BYTE> code;
     std::copy(c.begin(), c.end(), std::back_inserter(code));
     cs_insn* insn;
     size_t bytes_to_keep = 0;
     // Use code.data() to get the raw pointer and code.size() for the size
-    size_t count = cs_disasm(handle, code.data(), code.size(), baseAddr, 0, &insn);
+    size_t count = cs_disasm(getHandle(is64Bit), code.data(), code.size(), baseAddr, 0, &insn);
 
     if (count > 0) {
         for (size_t i = 0; i < count; i++) {
@@ -98,17 +94,18 @@ ULONGLONG Decompiler::estimateFuncSize(const std::vector<BYTE>& c, ULONGLONG bas
     return bytes_to_keep+1;
 }
 
-Decompilation Decompiler::decompile(std::vector<BYTE>& code, ULONGLONG baseAddr) {
-    ULONGLONG sizeEstimate = estimateFuncSize(code, baseAddr);
+Decompilation Decompiler::decompile(std::vector<BYTE>& code, ULONGLONG baseAddr, bool is64Bit) {
+    ULONGLONG sizeEstimate = estimateFuncSize(code, baseAddr,is64Bit);
     code.resize(sizeEstimate);
     cs_insn* insn;
-    size_t count = cs_disasm(handle, code.data(), code.size(), baseAddr, 0, &insn);
+    size_t count = cs_disasm(getHandle(is64Bit), code.data(), code.size(), baseAddr, 0, &insn);
     if (count == 0) {
         spdlog::error("Failed to disassemble bytes");
         return {0};
     }
     return Decompilation(insn, count, baseAddr);
 }
+
 void setColor(int color) {
     HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
     SetConsoleTextAttribute(hConsole, color);
@@ -117,7 +114,8 @@ void resetColor() {
     HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
     SetConsoleTextAttribute(hConsole, FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE);
 }
-std::pair<bool,size_t> Decompiler::linesToPrint(Decompilation decomp1, Decompilation decomp2, bool print, size_t lines = 16) {
+
+std::pair<bool,size_t> Decompiler::linesToPrint(Decompilation decomp1, Decompilation decomp2, bool print, size_t lines, ULONGLONG relativeBase) {
     size_t count1 = decomp1.count;
     size_t count2 = decomp2.count;
     cs_insn* insn1 = decomp1.insn;
@@ -131,9 +129,9 @@ std::pair<bool,size_t> Decompiler::linesToPrint(Decompilation decomp1, Decompila
         std::cout << std::string(80, '-') << std::endl;
 
         std::cout << std::left
-            << std::setw(10) << "ADDRESS"
-            << std::setw(32) << "BYTES"
-            << std::setw(20) << "MNEMONIC"
+            << std::setw(31) << "    ADDRESS"
+            << std::setw(26) << "BYTES"
+            << std::setw(15) << "MNEMONIC"
             << "OPERANDS" << std::endl;
 
         std::cout << std::string(80, '-') << std::endl;
@@ -148,54 +146,21 @@ std::pair<bool,size_t> Decompiler::linesToPrint(Decompilation decomp1, Decompila
                 memcmp(insn1[i].bytes, insn2[j].bytes, insn1[i].size) == 0) {
                 // Instructions match
                 if (print) {
-                    std::string bytes_str;
-                    for (size_t k = 0; k < insn1[i].size; k++) {
-                        char byte[4];
-                        snprintf(byte, sizeof(byte), "%02x ", insn1[i].bytes[k]);
-                        bytes_str += byte;
-                    }
+                    printLine(insn1[i], "", relativeBase);
 
-                    std::cout << std::hex << std::setw(10) << insn1[i].address
-                        << std::setw(32) << bytes_str
-                        << std::setw(20) << insn1[i].mnemonic
-                        << insn1[i].op_str << std::endl;
                 }
                 i++;
                 j++;
             }
             else {
                 // Instructions at same address differ
-                // Print code version (green)
                 if (print) {
-                    std::string bytes_str1;
-                    for (size_t k = 0; k < insn1[i].size; k++) {
-                        char byte[4];
-                        snprintf(byte, sizeof(byte), "%02x ", insn1[i].bytes[k]);
-                        bytes_str1 += byte;
-                    }
-
                     setColor(FOREGROUND_GREEN | FOREGROUND_INTENSITY);
-                    std::cout << "+"
-                        << std::hex << std::setw(10) << insn1[i].address
-                        << std::setw(32) << bytes_str1
-                        << std::setw(20) << insn1[i].mnemonic
-                        << insn1[i].op_str << std::endl;
+                    printLine(insn1[i], "+", relativeBase);
                     resetColor();
 
-                    // Print original version (red)
-                    std::string bytes_str2;
-                    for (size_t k = 0; k < insn2[j].size; k++) {
-                        char byte[4];
-                        snprintf(byte, sizeof(byte), "%02x ", insn2[j].bytes[k]);
-                        bytes_str2 += byte;
-                    }
-
                     setColor(FOREGROUND_RED | FOREGROUND_INTENSITY);
-                    std::cout << "-"
-                        << std::hex << std::setw(10) << insn2[j].address
-                        << std::setw(32) << bytes_str2
-                        << std::setw(20) << insn2[j].mnemonic
-                        << insn2[j].op_str << std::endl;
+                    printLine(insn2[j], "-", relativeBase);
                     resetColor();
                 }
                 lastModification = i;
@@ -207,20 +172,10 @@ std::pair<bool,size_t> Decompiler::linesToPrint(Decompilation decomp1, Decompila
             // Addresses don't match - one code has extra instructions
             if (j >= count2 || (i < count1 && (j >= count2 ||
                 (insn1[i].address - baseAddr1) < (insn2[j].address - baseAddr2)))) {
-                // Extra instruction in code (green)
                 if (print) {
-                    std::string bytes_str;
-                    for (size_t k = 0; k < insn1[i].size; k++) {
-                        char byte[4];
-                        snprintf(byte, sizeof(byte), "%02x ", insn1[i].bytes[k]);
-                        bytes_str += byte;
-                    }
+
                     setColor(FOREGROUND_GREEN | FOREGROUND_INTENSITY);
-                    std::cout << "+"
-                        << std::hex << std::setw(10) << insn1[i].address
-                        << std::setw(32) << bytes_str
-                        << std::setw(20) << insn1[i].mnemonic
-                        << insn1[i].op_str << std::endl;
+                    printLine(insn1[i],"+", relativeBase);
                     resetColor();
 
                 }
@@ -228,20 +183,10 @@ std::pair<bool,size_t> Decompiler::linesToPrint(Decompilation decomp1, Decompila
                 i++;
             }
             else {
-                // Extra instruction in original (red)
                 if (print) {
-                    std::string bytes_str;
-                    for (size_t k = 0; k < insn2[j].size; k++) {
-                        char byte[4];
-                        snprintf(byte, sizeof(byte), "%02x ", insn2[j].bytes[k]);
-                        bytes_str += byte;
-                    }
+                    
                     setColor(FOREGROUND_RED | FOREGROUND_INTENSITY);
-                    std::cout << "-"
-                        << std::hex << std::setw(10) << insn2[j].address
-                        << std::setw(32) << bytes_str
-                        << std::setw(20) << insn2[j].mnemonic
-                        << insn2[j].op_str << std::endl;
+					printLine(insn2[j], "-", relativeBase);
                     resetColor();
                 }
 
@@ -257,12 +202,40 @@ std::pair<bool,size_t> Decompiler::linesToPrint(Decompilation decomp1, Decompila
         return { lastModification != -1,std::min(lastModification + 12,std::max(count1,count2)) };
     }
 }
-bool Decompiler::printDecompilationDiff(std::string moduleName, std::string funcName, Decompilation decomp1, Decompilation decomp2) {
+bool Decompiler::printDecompilationDiff(std::string moduleName, std::string funcName, Decompilation decomp1, Decompilation decomp2, ULONGLONG relativeBase) {
 
-    std::pair<bool,size_t> linesToRead = linesToPrint(decomp1,decomp2,false);
+    std::pair<bool,size_t> linesToRead = linesToPrint(decomp1,decomp2,false,16,relativeBase);
     if (!linesToRead.first) return false; //is not modified
     if(!funcName.empty()) spdlog::info("[{}] Found modified function!: {}",moduleName, funcName);
-    linesToPrint(decomp1, decomp2, true,linesToRead.second);
+    linesToPrint(decomp1, decomp2, true,linesToRead.second, relativeBase);
     if ((decomp1.count - linesToRead.second) != 0) std::cout << "------ (" << std::dec << (decomp1.count - linesToRead.second) << ") lines remaining. . . ------" << std::endl;
     return true;
+}
+csh Decompiler::getHandle(bool is64Bit) const
+{
+    if (is64Bit) {
+        return handle64;
+    }
+    return handle32;
+}
+std::string Decompiler::printLine(cs_insn& insn, std::string prefix, ULONGLONG base) const
+{
+    std::string bytes_str;
+    for (size_t k = 0; k < insn.size; k++) {
+        char byte[4];
+        snprintf(byte, sizeof(byte), "%02x ", insn.bytes[k]);
+        bytes_str += byte;
+    }
+    std::ostringstream extraBaseStream;
+    extraBaseStream << std::hex << insn.address;
+    if(base) extraBaseStream << " (" << std::hex << (insn.address - base) << ")";
+    
+	std::string addr = extraBaseStream.str();
+
+    std::cout << std::setw(1) << prefix << std::hex << std::setw(30) << addr
+        << std::setw(26) << bytes_str
+        << std::setw(15) << insn.mnemonic
+        << insn.op_str << std::endl;
+
+    return std::string();
 }

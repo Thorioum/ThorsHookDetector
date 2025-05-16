@@ -38,8 +38,8 @@ InlineHookHandler::Result InlineHookHandler::scanForHooks(HANDLE procHandle, Dec
 				spdlog::info("Found new function in \"{}\"!: \"{}\"", procModuleElement.first, procFuncElement.first);
 				ULONG procFuncRVA = procFuncElement.second;
 				auto procFuncBytes = Memory::readFuncBytes(procHandle, procModule, procFuncRVA, procFuncElement.first);
-				Decompilation decomp = decompiler->decompile(procFuncBytes, procFuncRVA);
-				decompiler->printDecompilation(decomp);
+				Decompilation decomp = decompiler->decompile(procFuncBytes, (ULONGLONG)procModule + procFuncRVA, Memory::is64Bit(procHandle,procModule));
+				decompiler->printDecompilation(decomp,(ULONGLONG)procModule);
 				cs_free(decomp.insn, decomp.count);
 				continue;
 			}
@@ -58,14 +58,14 @@ InlineHookHandler::Result InlineHookHandler::scanForHooks(HANDLE procHandle, Dec
 			//the bytes will then be dissasembled then resized, trimming at a ret instruction for a better size estimate
 			//it is then checked once more whether the new more accurate resized functions are equal in bytes/dissasembly
 			//if not, they are printed and collected
-			Decompilation decomp1 = decompiler->decompile(procFuncBytes, procFuncRVA);
-			Decompilation decomp2 = decompiler->decompile(localFuncBytes, localFuncRVA);
+			Decompilation decomp1 = decompiler->decompile(procFuncBytes, (ULONGLONG)procModule + procFuncRVA, Memory::is64Bit(procHandle, procModule));
+			Decompilation decomp2 = decompiler->decompile(localFuncBytes, (ULONGLONG)localModule + localFuncRVA, Memory::is64Bit(procHandle, procModule));
 
 			if (!decomp1.insn || !decomp2.insn) {
 				spdlog::error("Failed to decompile function: {}. Error: {}", procFuncElement.first, GetLastError());
 				continue;
 			}
-			if (decompiler->printDecompilationDiff(procModuleElement.first, procFuncElement.first, decomp1, decomp2)) {
+			if (decompiler->printDecompilationDiff(procModuleElement.first, procFuncElement.first, decomp1, decomp2, (ULONGLONG)procModule)) {
 				std::string moduleKey = procModuleElement.first;
 				std::string funcKey = procFuncElement.first;
 				if (!result.hookedFuncs.count(moduleKey)) {
@@ -198,6 +198,10 @@ void GeneralHookHandler::scanForHooks(std::string procName, HANDLE procHandle, D
 				spdlog::info("{} has different size than local dll. Different version? Skipping. . .", procModuleElement.first);
 				ignoredModules.push_back(procModuleElement.first);
 			}
+			if (Memory::is64Bit(procHandle, procModule) != Memory::is64Bit(GetCurrentProcess(), localModule)) {
+				spdlog::info("{} has a x32/x64 bit mismatch with local dll. Skipping. . .", procModuleElement.first);
+				ignoredModules.push_back(procModuleElement.first);
+			}
 		}
 	}
 	spdlog::info("Found {} modules in process with {} matching locally.", procModules.size(), Util::countMatchingKeys(procModules, localModules));
@@ -221,7 +225,6 @@ void GeneralHookHandler::scanForHooks(std::string procName, HANDLE procHandle, D
 		spdlog::info("No hooks found in the EAT tables of all scanned modules.");
 	}
 
-	//command line
 	spdlog::info("All analysis completed!");
 	spdlog::info("---");
 	spdlog::info("---");
@@ -395,14 +398,19 @@ void GeneralHookHandler::scanForHooks(std::string procName, HANDLE procHandle, D
 					try {
 						ULONGLONG address = std::stoull(args.at(0), nullptr, 16);
 						auto funcBytes = Memory::readFuncBytes(procHandle, address, 1024);
-						Decompilation decomp = decompiler->decompile(funcBytes, address);
 
+						bool is64Bit = Memory::is64Bit(procHandle);
 						char moduleName[MAX_PATH] = { 0 };
 						HMODULE module = Memory::findModuleByAddress(procHandle, address);
-						if(module) GetModuleFileNameExA(procHandle, module, moduleName, sizeof(moduleName));
+						if (module) {
+							is64Bit = Memory::is64Bit(procHandle, module);
+							GetModuleFileNameExA(procHandle, module, moduleName, sizeof(moduleName));
+						}
+
+						Decompilation decomp = decompiler->decompile(funcBytes, address, is64Bit);
 
 						if (moduleName[0] != 0) std::cout << "-- (" << moduleName << ") --" << std::endl;
-						decompiler->printDecompilation(decomp);
+						decompiler->printDecompilation(decomp,(ULONGLONG)module);
 						cs_free(decomp.insn, decomp.count);
 					}
 					catch (const std::exception& ex) {
@@ -433,8 +441,8 @@ void GeneralHookHandler::scanForHooks(std::string procName, HANDLE procHandle, D
 					}
 					
 					std::vector<BYTE> funcBytes = Memory::readFuncBytes(procHandle, procModule, funcRVA, func);
-					Decompilation decomp = decompiler->decompile(funcBytes, funcRVA);
-					decompiler->printDecompilation(decomp);
+					Decompilation decomp = decompiler->decompile(funcBytes, (ULONGLONG)procModule + funcRVA, Memory::is64Bit(procHandle, procModule));
+					decompiler->printDecompilation(decomp,(ULONGLONG)procModule);
 					cs_free(decomp.insn, decomp.count);
 				}
 				}

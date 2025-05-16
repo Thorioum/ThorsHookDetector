@@ -20,6 +20,13 @@ namespace Memory {
 	ULONG getProcId(std::string name);
 	bool handleIsStillValid(HANDLE handle);
 
+	bool is64Bit(HANDLE handle);
+	bool is64Bit(HANDLE handle, HMODULE module);
+
+	void suspendThreads(HANDLE handle);
+	void resumeThreads(HANDLE handle);
+	std::vector<ULONG> GetThreadIds(ULONG processId);
+
 	ULONGLONG getModuleBaseAddr(ULONG procId, const char* modName);
 	HMODULE getLoadedModule(HANDLE handle, const char* modName);
 	ULONG getModuleSize(HANDLE handle, HMODULE module);

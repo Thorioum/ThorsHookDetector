@@ -201,7 +201,92 @@ std::vector<BYTE> Memory::readFuncBytes(HANDLE handle, ULONGLONG functionAddress
 
     return functionBytes;
 }
+std::vector<ULONG> Memory::GetThreadIds(ULONG processId) {
+    std::vector<ULONG> threadIds;
+    HANDLE threadSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
 
+    if (threadSnap != INVALID_HANDLE_VALUE) {
+        THREADENTRY32 te32;
+        te32.dwSize = sizeof(THREADENTRY32);
+
+        if (Thread32First(threadSnap, &te32)) {
+            do {
+                if (te32.th32OwnerProcessID == processId) {
+                    threadIds.push_back(te32.th32ThreadID);
+                }
+            } while (Thread32Next(threadSnap, &te32));
+        }
+        CloseHandle(threadSnap);
+    }
+    return threadIds;
+}
+
+void Memory::suspendThreads(HANDLE handle) {
+    DWORD processId = GetProcessId(handle);
+    if (processId == 0) {
+        return;
+    }
+
+    std::vector<DWORD> threadIds = GetThreadIds(processId);
+
+    for (DWORD threadId : threadIds) {
+        HANDLE hThread = OpenThread(THREAD_SUSPEND_RESUME, FALSE, threadId);
+        if (hThread != NULL) {
+            if (SuspendThread(hThread) == (DWORD)-1);
+            CloseHandle(hThread);
+        }
+    }
+    return;
+}
+void Memory::resumeThreads(HANDLE handle)
+{
+    DWORD processId = GetProcessId(handle);
+    if (processId == 0) {
+        return;
+    }
+
+    std::vector<DWORD> threadIds = GetThreadIds(processId);
+
+    for (DWORD threadId : threadIds) {
+        HANDLE hThread = OpenThread(THREAD_SUSPEND_RESUME, FALSE, threadId);
+        if (hThread != NULL) {
+            if (ResumeThread(hThread) == (DWORD)-1);
+            CloseHandle(hThread);
+        }
+    }
+    return;
+}
+bool Memory::is64Bit(HANDLE handle) {
+    BOOL isWow64 = FALSE;
+    if (!IsWow64Process(handle, &isWow64)) {
+        return FALSE; 
+    }
+    return !isWow64;
+}
+bool Memory::is64Bit(HANDLE handle, HMODULE module) {
+    //read modules dos header
+    IMAGE_DOS_HEADER dosHeader;
+    if (!ReadProcessMemory(handle, module, (LPVOID)&dosHeader, sizeof(dosHeader), 0)) {
+        spdlog::error("Failed to read DOS header: {}", GetLastError());
+        return 1024;
+    }
+    //read the ntHeader using the offset provided in the dosHeader
+    IMAGE_NT_HEADERS ntHeaders;
+    if (!ReadProcessMemory(handle, (BYTE*)module + dosHeader.e_lfanew, &ntHeaders, sizeof(ntHeaders), 0)) {
+        spdlog::error("Failed to read NT headers: {}", GetLastError());
+        return 1024;
+    }
+    switch (ntHeaders.FileHeader.Machine) {
+        case IMAGE_FILE_MACHINE_I386:    return false; // x86 (32-bit)
+        case IMAGE_FILE_MACHINE_AMD64:   return true;  // x64 (64-bit)
+        case IMAGE_FILE_MACHINE_IA64:    return true;  // IA-64 (rare)
+        default: {
+			spdlog::error("Unknown machine type: {}", ntHeaders.FileHeader.Machine);
+			return false; // Unknown machine type
+        }
+    }
+
+}
 ULONGLONG Memory::optionalCheckFuncSize(HANDLE handle, HMODULE module, std::string funcName, ULONG functionRVA) {
     //we can possibly get the true function size from the storage in the .pdata section, containing exception info
 
