@@ -18,5 +18,5 @@ After the analyis completes, gathering hooks, these commands can be ran after to
 - ``` decompile <Relative Virtual Address> || <Module Name> <Function Name> ```: decompiles the function at the specified address
 
 # Preview of program
-<img width="769" alt="BB2E8044-D671-4A21-B2E5-0241D047C423" src="https://github.com/user-attachments/assets/6cd2963a-9440-4a0d-b8bc-f860c17d925f" />
+![2025-05-16 00_01_57-Window](https://github.com/user-attachments/assets/8726f331-f972-4bba-84f8-3877249bf70e)
 <img width="865" alt="0C997315-1434-4D8A-BE67-77C77E7D72EE" src="https://github.com/user-attachments/assets/92fdd051-d2fa-4d01-bc9c-ba5bfac7db12" />
